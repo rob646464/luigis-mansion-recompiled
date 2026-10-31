@@ -193,6 +193,9 @@ struct RenderingSettings {
     // room light), so shadows vanish on things farther away. On: the band is extended to what the
     // player's view shows (enhancement). Off: the original range.
     bool shadowAnyDistance = true;
+    // Custom textures: DDS/PNG replacement files named tex1_<w>x<h>_<hash>_<fmt>.dds
+    // (Dolphin convention, Aurora texture replacement) in <data folder>/textures.
+    bool customTextures = false;
 };
 
 // ---- Enhanced lighting > Ghost lights (src/recomp/ghost_lights.cpp; docs/RENDERING.md) ----
