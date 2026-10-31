@@ -24,6 +24,8 @@
 #include "recomp/unused2.h"
 
 #include <aurora/aurora.h>
+#include <dolphin/gx.h>
+#include <aurora/texture.hpp>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <SDL3/SDL.h>
@@ -795,6 +797,35 @@ void gameTab() {
     updatesSection();
 }
 
+// Texture pack (F1 > Visuals > Rendering > Custom textures): the DDS/PNG files in
+// <data folder>/textures replace the game's textures (Aurora texture replacement).
+static aurora::texture::ReplacementGroup sTexturePack;
+static bool sTexturePackLoaded = false;
+
+void applyTexturePack(bool reload = false) {
+    const bool want = port::settings().rendering.customTextures;
+    const auto dir = port::dataDir() / "textures";
+    if (want && sTexturePackLoaded && reload) {
+        aurora::texture::reload_replacement_directory(dir, sTexturePack);
+    }
+    else if (want && !sTexturePackLoaded) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        sTexturePack = aurora::texture::load_replacement_directory(dir);
+    }
+    else if (!want && sTexturePackLoaded) {
+        aurora::texture::unregister_replacements(sTexturePack);
+        sTexturePack = {};
+    }
+    else {
+        return;
+    }
+    sTexturePackLoaded = want;
+    std::printf("[textures] %s: %zu files in %s\n", want ? "loaded" : "removed",
+        sTexturePack.registrations.size(), port::displayPath(dir).c_str());
+    std::fflush(stdout);
+}
+
 // Hardware-accuracy toggles (all on by default). Each entry: checkbox bound to
 // settings().rendering.<flag>, sDirty |= ..., and a tooltip saying what changes visually
 // and roughly what it costs.
@@ -844,7 +875,7 @@ void renderingTab() {
             "console: the same banding and dither grain as the rest of the image at their edges and\n"
             "see-through parts instead of smooth 8-bit gradients. Subtle in this game.\n"
             "Costs a few full-screen passes per frame (well under 1 ms at 1440p; more with MSAA).") +
-                                (enhOverride ? kEnhNote : "");
+            (enhOverride ? kEnhNote : "");
         ImGui::SetItemTooltip("%s", tip.c_str());
     }
     {
@@ -867,10 +898,25 @@ void renderingTab() {
             "lines, no blotches, no grain. Off: exactly what the GameCube outputs (default).\n"
             "No measurable cost.%s",
             enhOverride ? "\n\nNot used while Enhanced lighting is on: the 6-bit framebuffer is off then and\n"
-                          "the picture is plain 8-bit, with nothing left to smooth." : "");
+            "the picture is plain 8-bit, with nothing left to smooth." : "");
     }
     ImGui::Unindent();
     ImGui::EndDisabled();
+    ImGui::SeparatorText("Textures");
+    if (recomp::menu::Checkbox("Custom textures", &r.customTextures)) {
+        sDirty = true;
+        applyTexturePack();
+    }
+    ImGui::SetItemTooltip(
+        "Replaces the game's textures with the DDS/PNG files found in the 'textures' folder\n"
+        "of the data folder (tex1_<width>x<height>_<hash>_<format>.dds, as Dolphin names them).\n"
+        "Textures already on screen may only change after the next room load.");
+    ImGui::BeginDisabled(!r.customTextures);
+    if (recomp::menu::Button("Reload textures")) applyTexturePack(true);
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Reads the textures folder again (after adding or removing files).");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", port::displayPath(port::dataDir() / "textures").c_str());
     sDirty |= recomp::menu::Checkbox("Early depth for cut-out textures", &r.earlyZAlphaDepth);
     ImGui::SetItemTooltip(
         "Room geometry and Luigi test depth before texturing. On the console that also writes the\n"
@@ -1936,6 +1982,7 @@ void init() {
     port::loadSettings();
     recomp::ui::install(recomp::ui::Context::Game);
     applyWindowSettings();
+    applyTexturePack();
     // LM_MENU=<tab> (testing/screenshots): start with the menu open on that tab.
     if (const char* tab = std::getenv("LM_MENU"); tab && *tab) {
         sOpen = true;
@@ -2197,6 +2244,7 @@ void draw() {
                 port::resetSettingsToDefaults();
                 // Settings applied only when their control changes: apply the defaults now too.
                 applyWindowSettings();
+                applyTexturePack();
                 const bool hmPal = port::settings().enhancements.hiddenMansionPal;
                 if (!recomp::hm::hiddenActive() && !recomp::hm::labChoiceAvailable() &&
                     (hmPal ? port::hiddenMansionPal() : port::hiddenMansionUs()) == port::Avail::Yes)
