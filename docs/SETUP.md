@@ -456,9 +456,19 @@ Differences the runtime handles for the European game:
 
 - **Frame pacing.** The European `LMDisplayUtil` paces frames with an `OSAlarm` of N/60 s
   (the USA game counts N VI retraces) and re-submits the framebuffer from its post-retrace
-  callback every retrace. The runtime HLEs `OSCreateAlarm`/`OSSetAlarm`/`OSCancelAlarm`
-  (an alarm re-armed from its own expiry counts from the expiry, so host latency does not
-  slow the game) and presents a frame at `GXCopyDisp` instead of `VISetNextFrameBuffer`.
+  callback every retrace. The runtime HLEs `OSCreateAlarm`/`OSSetAlarm`/`OSSetAbsAlarm`/
+  `OSSetPeriodicAlarm`/`OSCancelAlarm` (an alarm re-armed from its own expiry counts from the
+  expiry, so host latency does not slow the game) and presents a frame at `GXCopyDisp` instead of
+  `VISetNextFrameBuffer`. Alarm times are signed (OSTime): a delay of zero or less, or an
+  absolute time already passed, fires as soon as possible (the European `SITransfer` passes
+  `time - now` to `OSSetAlarm`, which can be negative; the USA one calls `OSSetAbsAlarm`, which
+  the European SDK does not have); huge delays are capped (~115 days) before the conversion to
+  host clock units, which overflowed before (x86: fired at once by luck, arm64: never). A
+  periodic alarm whose start is in the past keeps its phase (first expiry at
+  `start + period * ((now - start) / period + 1)`, missed periods skipped, as in the SDK). No
+  known game path hits these cases (the pacer's delays are constant and positive; the SI and
+  periodic alarms are unused with the PAD HLE'd). Test aid `LM_ALARM_TEST_PAST=<n>[,<ms>]`: the
+  first n alarms are set ms (default 100) in the past; the alarm log marks them `past`.
 - **50 / 60 Hz.** F1 > Visuals > *PAL refresh rate*: 50 Hz (default, the console's PAL
   video timing) or 60 Hz (PAL60). Because the European game times its frames with the
   alarm, the logic speed is the same either way (30 fps, like the USA game); the setting
@@ -501,7 +511,7 @@ tags.cpp; `LM_HEAP_LOG=1` logs every allocation and free with the heap's free to
 block), a DVD read or the loaders' Yay0 decompression (`fn_800071D0`) aimed at low memory or
 outside guest memory is refused (hle_dvd.cpp), and the OS globals the game reads at run time (bus
 and core clock, memory size, TV format) are checked every frame and restored (`verifyLowMemory`).
-`LM_ALARM_LOG=1` logs every OS alarm (ticks, delay); `LM_WATCH=80000000,100` shows any store to
+`LM_ALARM_LOG=1` logs every OS alarm (signed ticks, delay, `past` / `periodic`); `LM_WATCH=80000000,100` shows any store to
 the OS globals after `OSInit`.
 
 ### Version-aware code
