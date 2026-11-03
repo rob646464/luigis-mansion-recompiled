@@ -1,6 +1,7 @@
 # Game data must NEVER be committed -- users supply their own dumps.
 /Luigis Mansion US/
 /Lugis Mansion PAL/
+/Luigis Mansion JP/
 /orig/
 *.iso
 *.gcm
