@@ -283,6 +283,9 @@ int main(int argc, char* argv[]) {
     static const std::string sCacheOverride = std::getenv("LM_CACHE_DIR") ? utf8(port::envPath("LM_CACHE_DIR")) : "";
     if (!sCacheOverride.empty()) config.cachePath = sCacheOverride.c_str();
     const port::Options& opts = port::options();
+    // Open on the primary display. The zero-filled config asked for (0,0), and SDL put the window (and its
+    // fullscreen) on whichever display is nearest that point, e.g. a side monitor left of and below the main one.
+    config.windowPosX = config.windowPosY = SDL_WINDOWPOS_CENTERED;
     config.startFullscreen = opts.fullscreen || port::settings().video.fullscreen;
     config.windowWidth = opts.windowWidth;
     config.windowHeight = opts.windowHeight;
