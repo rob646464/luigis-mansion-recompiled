@@ -20,7 +20,7 @@ REQUIREMENTS
 - X11 or Wayland desktop, and PulseAudio or PipeWire (the default on every desktop) for sound.
 - About 2 GB of free disk space (the game module built at first start, shader caches).
 - Your own Luigi's Mansion disc image (ISO, GCM, RVZ, WIA, GCZ, CISO, NFS, TGC):
-    USA release (GLME01)  and/or  European release (GLMP01).
+    USA (GLME01), European (GLMP01) and/or Japanese (GLMJ01) release.
   Other games, other revisions and modified images are rejected.
 
 

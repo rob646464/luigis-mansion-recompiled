@@ -10,7 +10,7 @@ REQUIREMENTS
 - A Mac with Apple silicon (M1 or newer) running macOS 13 Ventura or newer.
 - About 2 GB of free disk space (the game module built at first start, shader caches).
 - Your own Luigi's Mansion disc image (ISO, GCM, RVZ, WIA, GCZ, CISO, NFS, TGC):
-    USA release (GLME01)  and/or  European release (GLMP01).
+    USA (GLME01), European (GLMP01) and/or Japanese (GLMJ01) release.
 
 
 HOW TO RUN
