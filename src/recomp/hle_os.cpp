@@ -11,6 +11,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -114,11 +115,40 @@ std::unordered_map<u32, u32> sAlarmGen;  // alarm -> generation of its pending e
 using AlarmClock = std::chrono::steady_clock;
 std::unordered_map<u32, AlarmClock::time_point> sAlarmFired;  // alarm -> when it last expired
 
-void armAlarm(u32 alarm, u64 ticks, u32 handler, u64 period) {
+// Longest delay an alarm is converted with (~115 days). OSTime is signed 64-bit: a delay of
+// 2^62 ticks in a double -> duration_cast overflows the clock's int64 nanoseconds (undefined:
+// x86 gives INT64_MIN, i.e. "fires at once", arm64 saturates, i.e. "never").
+constexpr double kMaxAlarmSeconds = 1e7;
+
+// Test aid LM_ALARM_TEST_PAST=<n>[,<ms>]: the first n alarms set (OSSetAlarm, OSSetAbsAlarm,
+// OSSetPeriodicAlarm) get their target moved <ms> (default 100) into the past: OSSetAlarm a delay
+// of -ms, the absolute ones a time / start ms before now. They must fire at once (periodic ones
+// then keep the phase of their start), as on the console.
+s64 testPastTicks() {
+    static int sLeft = -1;
+    static s64 sTicks = 0;
+    if (sLeft < 0) {
+        sLeft = 0;
+        if (const char* e = std::getenv("LM_ALARM_TEST_PAST")) {
+            double ms = 100.0;
+            sLeft = std::atoi(e);
+            if (const char* comma = std::strchr(e, ',')) ms = std::atof(comma + 1);
+            sTicks = s64(ms / 1000.0 * kTimerClock);
+            log("[alarm] test: the first %d alarms are set %.1f ms in the past", sLeft, ms);
+        }
+    }
+    if (sLeft == 0) return 0;
+    --sLeft;
+    return sTicks;
+}
+
+// ticks: delay from now (signed OSTime; <= 0 fires as soon as possible). fromExpiry: count the
+// delay from the alarm's last expiry when it is re-armed within that delay (relative alarms only).
+void armAlarm(u32 alarm, s64 ticks, u32 handler, u64 period, bool fromExpiry = true) {
     // Fast-forward (skip.h) speeds alarms up like it speeds up retraces.
     const double speed = std::max(1.0, skip::retraceSpeed());
-    const auto delay = std::chrono::duration_cast<AlarmClock::duration>(
-        std::chrono::duration<double>(double(ticks) / kTimerClock / speed));
+    const double delaySec = std::min(std::max(0.0, double(ticks) / kTimerClock / speed), kMaxAlarmSeconds);
+    const auto delay = std::chrono::duration_cast<AlarmClock::duration>(std::chrono::duration<double>(delaySec));
     const auto now = AlarmClock::now();
     auto when = now + delay;
     u32 gen;
@@ -129,25 +159,30 @@ void armAlarm(u32 alarm, u64 ticks, u32 handler, u64 period) {
         // set it again) counts from the expiry, not from when the host got around to it:
         // on the console that gap is microseconds, here it includes host scheduling and
         // the lockstep wait for the display, which would otherwise slow the game down.
-        if (auto it = sAlarmFired.find(alarm); it != sAlarmFired.end() && now - it->second < delay)
-            when = it->second + delay;
+        if (fromExpiry)
+            if (auto it = sAlarmFired.find(alarm); it != sAlarmFired.end() && now - it->second < delay)
+                when = it->second + delay;
     }
     wr32(alarm, handler);
-    const double seconds = std::chrono::duration<double>(when - now).count();
+    const double seconds = std::max(0.0, std::chrono::duration<double>(when - now).count());
     static const bool sAlarmLog = std::getenv("LM_ALARM_LOG") != nullptr;
     if (sAlarmLog)
-        log("[alarm] %08X ticks %llu (%.2f ms) fires in %.2f ms speed %.2f", alarm, (unsigned long long)ticks,
-            double(ticks) / kTimerClock * 1000.0, seconds * 1000.0, speed);
-    sched::postIrqAfter(std::max(0.0, seconds), [alarm, gen, handler, period, when](Ctx& c) {
+        log("[alarm] %08X ticks %lld (%.2f ms)%s fires in %.2f ms speed %.2f%s", alarm, (long long)ticks,
+            double(ticks) / kTimerClock * 1000.0, ticks <= 0 ? " past" : "", seconds * 1000.0, speed,
+            period ? " periodic" : "");
+    sched::postIrqAfter(seconds, [alarm, gen, handler, period, when](Ctx& c) {
         {
             std::lock_guard lk(sAlarmM);
             if (sAlarmGen[alarm] != gen) return;  // cancelled or re-armed
             sAlarmFired[alarm] = when;
         }
-        if (period) armAlarm(alarm, period, handler, period);
+        // The next period counts from this expiry (fromExpiry), so the phase holds.
+        if (period) armAlarm(alarm, s64(std::min<u64>(period, u64(INT64_MAX))), handler, period);
         guestCall(c, handler, alarm, 0);
     });
 }
+
+inline s64 argTime(const Ctx& c, int hi) { return s64(u64(c.r[hi]) << 32 | c.r[hi + 1]); }
 }  // namespace
 
 HLE(OSCreateAlarm) {
@@ -156,11 +191,34 @@ HLE(OSCreateAlarm) {
     ++sAlarmGen[c.r[3]];
     sAlarmFired.erase(c.r[3]);
 }
-HLE(OSSetAlarm) { armAlarm(c.r[3], u64(c.r[5]) << 32 | c.r[6], c.r[7], 0); }
+// (alarm r3, OSTime tick r5:r6, handler r7): relative. The European SITransfer passes
+// "time - now" here, which is negative when the transfer time has already passed.
+HLE(OSSetAlarm) {
+    const s64 past = testPastTicks();
+    armAlarm(c.r[3], past ? -past : argTime(c, 5), c.r[7], 0);
+}
+// (alarm r3, OSTime time r5:r6, handler r7): absolute time base. USA only (its SITransfer);
+// the European SDK has no OSSetAbsAlarm.
+HLE(OSSetAbsAlarm) {
+    const s64 now = s64(timeBase());
+    const s64 past = testPastTicks();
+    const s64 time = past ? now - past : argTime(c, 5);
+    armAlarm(c.r[3], time - now, c.r[7], 0, false);
+}
 HLE(OSSetPeriodicAlarm) {
-    // (alarm, u64 start r5:r6, u64 period r7:r8, handler r9); start is absolute time.
-    const u64 now = timeBase(), start = u64(c.r[5]) << 32 | c.r[6], period = u64(c.r[7]) << 32 | c.r[8];
-    armAlarm(c.r[3], start > now ? start - now : 0, c.r[9], period ? period : 1);
+    // (alarm, OSTime start r5:r6, OSTime period r7:r8, handler r9); start is absolute time.
+    // A start in the past keeps its phase (SDK): the first expiry is the next
+    // start + period * k after now, missed periods skipped.
+    const s64 now = s64(timeBase());
+    const s64 past = testPastTicks();
+    const s64 start = past ? now - past : argTime(c, 5);
+    const s64 period = std::max<s64>(argTime(c, 7), 1);
+    s64 delay = start - now;  // OSTime values are far from the s64 limits (timeBase since 2000)
+    if (start < now) {
+        const u64 behind = u64(now) - u64(start), p = u64(period);
+        delay = s64(p - behind % p);  // = start + period * ((now - start) / period + 1) - now
+    }
+    armAlarm(c.r[3], delay, c.r[9], u64(period), false);
 }
 HLE(OSCancelAlarm) {
     std::lock_guard lk(sAlarmM);
