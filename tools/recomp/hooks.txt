@@ -36,6 +36,9 @@ fn_80191A1C
 fn_8019754C us pal
 fn_80197810 us pal
 fn_80197B30 us pal
+# AFC stream scheduler, interrupts off for the same reason: the main and the sound thread both run
+# it, a start interrupted halfway started the stream twice (crackle, issue #25; hle_audio.cpp).
+fn_80193B20 us pal
 # HVQM4 movie (options menu "View a Pikmin(TM) Movie"): the audio stream is not reported
 # ready before the scene's first picture, or the player deadlocks waiting for its first
 # picture buffer (src/recomp/hvqm.cpp).

@@ -587,6 +587,17 @@ HLE(fn_80197810) {
     sillyworld::onSeStarted(c, id, handle);
 }
 HLE(fn_80197B30) { callWithInterruptsOff(c, "fn_80197B30"); }
+// The AFC stream scheduler (US fn_80193B20, issue #25) has the same kind of window: it runs on
+// the main thread (priority 16) and on the sound thread (priority 17), and for each request in
+// state 2 it starts the stream (fn_8019480C: DVDOpen, header, the first 0x1680-byte piece via
+// DVDReadAsyncPrio) and only then sets state 3. A main thread woken inside a start saw the request
+// still in state 2 and started the stream again: the first piece was read twice, the second
+// never, and the stale completion of the first read was taken for the new one, so the ADPCM
+// stream played with broken history (a loud crackle/burst over the first second, e.g. TMOpen at
+// the opening, TMansion's thunder on the walk up to the mansion). Here the window spans HLE calls
+// where interrupts are taken (in 1.1.5 also the whole host read, see hle_dvd.cpp); with
+// interrupts off, as for the SE starts, the check, start and state change are one step.
+HLE(fn_80193B20) { callWithInterruptsOff(c, "fn_80193B20"); }
 
 // JAI sound-effect frame update (US fn_80191A1C, r3 = JAI SE manager): for each category
 // (count at r13-0x6B4) walks the active JAISound list (head: [[mgr+0]+0x1E8] + cat*0xC + 4,

@@ -117,7 +117,8 @@ runtime lessons). `LM_TRACE=801A13C0` (US) logs every such voice stop. Since
 **Backport from the SMS port (2026-10, SMS docs/BACKPORT.md rows 74-76).**
 Taken: the host waits that release the guest CPU (the lockstep handoff in
 `frame::present`, `frame::gxBlockingWait` for `GXDrawDone`, and
-`DVDReadAsyncPrio`'s host read) keep it when the caller has interrupts off
+`DVDReadAsyncPrio`'s host read, which since issue #25 runs on a drive thread
+and no longer releases anything) keep it when the caller has interrupts off
 (`sched::interruptsEnabled()`, which is also false in an interrupt handler): no
 other thread may run inside a critical section, as on the console.
 `Jac_imixcopy` reports the mix through `audio::noteGuestMixed()` (the shared
@@ -566,6 +567,72 @@ changes) keeps them under full scale (same scene: peak 31986).
 `SDL_AUDIO_DRIVER=disk SDL_AUDIO_DISK_OUTPUT_FILE=<file> LM_AUDIO=1` is the way
 to test the live output path without speakers (raw float32 at the device rate,
 44100 Hz here).
+
+**The stream started twice (the actual crackle, branch issue25-crackle).** The
+1.1.5 reports were specific: loud crackling of the thunder on the walk up to the
+mansion, the first time after loading a save, never on a later visit (i7-6700K /
+GTX 1070, USA RVZ; the log's two underruns are elsewhere and the overload check
+never fired). A Switch port of this recompilation found the mechanism (issue
+comment): two 5760-byte reads of the stream at the same offset, so the first
+piece played twice and the second never, and the AFC decoder's ADPCM history was
+wrong from there on. The music on those scenes is an AFC stream
+(`/AudioRes/Stream/TMansion.afc`, at the opening `TMOpen.afc`), started by the
+JAI stream manager `fn_80193B20` (PAL 0x801970DC): for each request in state 2 it
+calls `fn_8019480C` (`DVDOpen`, header, offset 0x20, the first 0x1680-byte piece
+through `fn_801946A4` -> `DVDReadAsyncPrio`, completion `fn_80194698`) and only
+afterwards sets state 3. Both the main thread (priority 16) and the sound thread
+(priority 17) run that manager. When the main thread got the CPU inside a start,
+it found the request still in state 2 and started the stream again, and the
+stale completion of the first read was taken for the second one. Two windows:
+
+- `DVDReadAsyncPrio` did the host read inside the call with the guest CPU
+  released (`sched::withCpuReleased`, so a slow read would not hold off
+  interrupts). On the console the call only queues the command and returns; no
+  other guest code runs before it returns. Here every other thread could, for as
+  long as the host read took: longer for an RVZ block that is not decompressed
+  yet or a file the OS has not cached (a first load after start-up), which fits
+  "only the first time". Now the call queues the read for a host "drive" thread
+  (`hle_dvd.cpp`) and returns at once. The completion interrupt comes the
+  modelled latency after the data is in guest memory, as before (only the guest
+  thread is no longer held), in issue order; closing, reopening or synchronously
+  reading a file first waits for its host read. JAudio's `LoadADPCM`
+  (`fn_801ABB40`) has the same "advance after the call" pattern, so this is a
+  general fix for async readers, not one for the stream.
+- The rest of the start spans HLE calls where interrupts are taken, so the main
+  thread could still preempt it there (on the console a window of a few
+  instructions). `fn_80193B20` now runs with interrupts off, like the JAI SE
+  starts that had the same two-thread race (`hle_audio.cpp`).
+
+Measured at the opening (title -> new game, `TMOpen.afc`, user settings with
+Enhanced lighting Ultra at 80 fps, three instances side by side,
+`LM_AUDIO_WAV_RAW` recordings compared sample by sample with a fixed run 1.25-4 s
+after the stream start):
+
+| Build | Runs | Stream started twice | Recording bit-exact to the reference |
+|---|---|---|---|
+| 1.1.5 path (`LM_DVD_ASYNC=old`), no added delay | 12 | 2 | 10 (never in the 2 double starts: 6% RMS error throughout, peaks of twice the music's level in the first second) |
+| 1.1.5 path, host reads +1-5 ms (`LM_DVD_HOST_DELAY`) | 7 | 2 | 5 (the same broken stream in both double starts) |
+| drive thread only, +0-20 ms | 29 | 2 (harmless there: both recordings exact) | 29 |
+| 1.1.5 path + `fn_80193B20` interrupts off, +5/+20 ms | 4 | 0 | 4 |
+| drive thread + `fn_80193B20` interrupts off, +0-20 ms | 21 | 0 | 21 |
+
+Every double start on the old path produced the same broken stream (offsets
+0x20, 0x20, 0x2D20: piece 1 never read). The walk-up (`TMansion.afc`) goes
+through the same manager, thread and reads (`LM_START_MAP=1` route of
+docs/INTERPOLATION.md "Event scenes"); the race did not hit there in 9 runs (2 of
+them on the plain 1.1.5 path), so that scene is covered by the mechanism, not
+a reproduction. Also checked: title -> opening -> foyer (130 s) and the Pikmin
+movie (full length, 121 s between its first and last open) with the fix.
+The suggested fix in the issue (small async reads done in place without yielding,
+large ones still yielding) closes the first window for reads up to 32 KB, but
+keeps it open for larger async reads and holds the guest CPU (and so the AI
+interrupt) for the whole host read; the drive thread does neither.
+
+Diagnostics: an async read on a file whose previous read has not completed, or
+one repeating the previous offset, is always logged (`[dvd] async read on file
+... still in flight`, first 20 then every 100th). `LM_DVD_LOG=1` logs opens (path,
+thread, priority) and every async read; `LM_DVD_HOST_DELAY=<ms>` makes every host
+read slower (a slow disc image); `LM_DVD_ASYNC=old` is the 1.1.5 path (A/B only).
 
 ## DVD audio streaming
 
