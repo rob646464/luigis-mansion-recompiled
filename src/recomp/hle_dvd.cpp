@@ -1,9 +1,10 @@
-// HLE: DVD file system, on top of Aurora's disc reader. Reads complete
-// synchronously; async completions are delivered as interrupts.
+// HLE: DVD file system, on top of Aurora's disc reader. Synchronous reads block the calling
+// thread; async reads run on a host "drive" thread and complete as interrupts.
 #include "recomp/hidden_mansion.h"
 #include "recomp/room_swap.h"
 #include "recomp/unused_maps.h"
 #include "recomp/unused2.h"
+#include "recomp/cpu_qos.h"
 #include "recomp/hle.h"
 #include "recomp/runtime.h"
 #include "recomp/sched.h"
@@ -12,9 +13,14 @@
 #include <dolphin/dvd.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace recomp {
@@ -100,6 +106,128 @@ s32 overlayOf(u32 guest) {
     return it == sOverlay.end() ? -1 : it->second;
 }
 
+// ---- The drive: async reads (issue #25) ----
+// On the console DVDReadAsyncPrio only queues the command and returns; no other guest code runs
+// before it returns. JAudio's AFC streamer depends on that: LoadADPCM (fn_801ABB40) passes its
+// file offset to DVDReadAsyncPrio and advances it only after the call returns. Up to 1.1.5 the
+// HLE did the host read inside the call with the guest CPU released, so the previous piece's
+// completion interrupt (__LoadFin -> LoadADPCM for the next buffer) could run in that window and
+// issue a second read at the same, not yet advanced offset: a stream piece played twice, the next
+// one never, and the ADPCM history was wrong until the next reset (loud crackle, e.g. the thunder
+// in TMansion.afc on the walk up to the mansion, mostly with slow reads: RVZ, first load after
+// boot). Now the call only queues the read for this host thread, like the drive, and returns;
+// the completion interrupt is raised the modelled latency after the data is in guest memory (the
+// same timing as before, minus the guest thread being held). Completions stay in issue order.
+// LM_DVD_ASYNC=old restores the old path (A/B only).
+struct DriveReq {
+    u32 guest;
+    std::function<s32()> read;
+    double latency;  // modelled drive time, counted from the end of the host read (as before)
+    std::function<void(Ctx&, s32)> done;
+};
+std::mutex sDriveM;
+std::condition_variable sDriveCv, sDriveIdleCv;
+std::deque<DriveReq> sDriveQ;
+std::unordered_map<u32, int> sHostBusy;  // guest DVDFileInfo -> host reads queued or running
+std::unordered_map<u32, int> sPending;   // guest DVDFileInfo -> async reads not completed yet
+std::unordered_map<u32, u64> sLastAsync; // guest DVDFileInfo -> last async (offset << 32 | size)
+std::chrono::steady_clock::time_point sLastDue;
+
+bool oldAsyncPath() {
+    static const bool v = [] {
+        const char* e = std::getenv("LM_DVD_ASYNC");
+        return e && std::strcmp(e, "old") == 0;
+    }();
+    return v;
+}
+bool dvdLog() {
+    static const bool v = std::getenv("LM_DVD_LOG") != nullptr;
+    return v;
+}
+
+// Test aid: LM_DVD_HOST_DELAY=<ms> makes every host read take that much longer (a slow disc
+// image: RVZ blocks, an SD card, a busy drive), which widened the issue #25 race.
+void hostDelay() {
+    static const double ms = [] {
+        const char* e = std::getenv("LM_DVD_HOST_DELAY");
+        return e ? std::atof(e) : 0.0;
+    }();
+    if (ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(ms));
+}
+
+void driveMain() {
+    cpu::setCurrent(cpu::Role::Guest);  // it does what the guest thread did before (issue #18 policy)
+    std::unique_lock lk(sDriveM);
+    for (;;) {
+        sDriveCv.wait(lk, [] { return !sDriveQ.empty(); });
+        DriveReq r = std::move(sDriveQ.front());
+        sDriveQ.pop_front();
+        lk.unlock();
+        const s32 result = r.read();
+        lk.lock();
+        if (--sHostBusy[r.guest] <= 0) sHostBusy.erase(r.guest);
+        sDriveIdleCv.notify_all();
+        const auto now = std::chrono::steady_clock::now();
+        auto due = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                             std::chrono::duration<double>(r.latency));
+        if (due < sLastDue) due = sLastDue;  // complete in issue order
+        sLastDue = due;
+        const double delay = due > now ? std::chrono::duration<double>(due - now).count() : 0.0;
+        sched::postIrqAfter(delay, [done = std::move(r.done), result](Ctx& ic) { done(ic, result); });
+    }
+}
+
+void driveQueue(DriveReq r) {
+    static std::once_flag sStart;
+    std::call_once(sStart, [] { std::thread(driveMain).detach(); });
+    std::lock_guard lk(sDriveM);
+    ++sHostBusy[r.guest];
+    sDriveQ.push_back(std::move(r));
+    sDriveCv.notify_one();
+}
+
+// Waits until the drive thread no longer uses this file's host state (before it is closed,
+// reopened or read synchronously). Only the host read is waited for; its completion interrupt
+// still comes later. Does not need the guest CPU, so holding it here cannot deadlock.
+void driveDrain(u32 guest, bool reopen = false) {
+    std::unique_lock lk(sDriveM);
+    sDriveIdleCv.wait(lk, [guest] { return sHostBusy.find(guest) == sHostBusy.end(); });
+    if (reopen) sLastAsync.erase(guest);
+}
+
+// Diagnostic: on the console a DVDFileInfo can only carry one command, so an async read issued
+// while the previous one on the same file has not completed, or one repeating the previous
+// offset, means the game's bookkeeping was broken (the issue #25 duplicate stream piece).
+std::atomic<u32> sDupReads{0}, sBusyReads{0};
+void noteAsync(u32 guest, u32 off, u32 size, u32 lr) {
+    std::lock_guard lk(sDriveM);
+    const bool busy = sPending[guest]++ > 0;
+    const u64 key = u64(off) << 32 | size;
+    auto it = sLastAsync.find(guest);
+    const bool dup = it != sLastAsync.end() && it->second == key && size != 0;
+    sLastAsync[guest] = key;
+    if (busy) {
+        const u32 n = ++sBusyReads;
+        if (n <= 20 || n % 100 == 0)
+            log("[dvd] async read on file %08X while its previous read is still in flight (offset %X, %X "
+                "bytes, lr %08X; %u since start)", guest, off, size, lr, n);
+    }
+    if (dup) {
+        const u32 n = ++sDupReads;
+        if (n <= 20 || n % 100 == 0)
+            log("[dvd] async read on file %08X repeats the previous offset %X (%X bytes, lr %08X; %u since "
+                "start)", guest, off, size, lr, n);
+    }
+    if (dvdLog())
+        log("[dvd] async read file %08X offset %X size %X lr %08X thread %08X%s%s", guest, off, size, lr,
+            sched::currentGuest(), sched::inIrq() ? " in irq" : "", busy ? " (busy)" : "");
+}
+void noteAsyncDone(u32 guest) {
+    std::lock_guard lk(sDriveM);
+    auto it = sPending.find(guest);
+    if (it != sPending.end() && --it->second <= 0) sPending.erase(it);
+}
+
 bool openWith(u32 guest, BOOL ok, const DVDFileInfo& fi) {
     if (!ok) return false;
     sOverlay.erase(guest);
@@ -131,12 +259,17 @@ HLE(DVDConvertPathToEntrynum) {
     }
     const s32 n = DVDConvertPathToEntrynum(gstr(c.r[3]));
     if (n < 0) log("[dvd] path not found: %s", gstr(c.r[3]));
+    else if (dvdLog()) log("[dvd] entry %d = %s", n, gstr(c.r[3]));
     c.r[3] = u32(n);
 }
 
 HLE(DVDOpen) {
+    driveDrain(c.r[4], true);
     DVDFileInfo fi{};
     const char* path = gstr(c.r[3]);
+    if (dvdLog())
+        log("[dvd] open %s as file %08X (thread %08X prio %d%s, lr %08X)", path, c.r[4], sched::currentGuest(),
+            sched::currentGuest() ? sched::priority(sched::currentGuest()) : -1, sched::inIrq() ? " in irq" : "", c.lr);
     if (const s32 e = ovEntry(path); e >= 0) {
         c.r[3] = openOverlay(c.r[4], e);
         return;
@@ -145,6 +278,8 @@ HLE(DVDOpen) {
     if (!c.r[3]) log("[dvd] open failed: %s", path);
 }
 HLE(DVDFastOpen) {
+    driveDrain(c.r[4], true);
+    if (dvdLog()) log("[dvd] open entry %d as file %08X", s32(c.r[3]), c.r[4]);
     if (ovIs(s32(c.r[3]))) {
         c.r[3] = openOverlay(c.r[4], s32(c.r[3]));
         return;
@@ -153,6 +288,7 @@ HLE(DVDFastOpen) {
     c.r[3] = openWith(c.r[4], DVDFastOpen(s32(c.r[3]), &fi), fi);
 }
 HLE(DVDClose) {
+    driveDrain(c.r[3], true);
     sOverlay.erase(c.r[3]);
     if (DVDFileInfo* fi = hostFile(c.r[3])) {
         DVDClose(fi);
@@ -162,6 +298,7 @@ HLE(DVDClose) {
 }
 
 HLE(DVDReadPrio) {
+    driveDrain(c.r[3]);
     DVDFileInfo* fi = hostFile(c.r[3]);
     watchRange(c.r[4], c.r[5], "DVDReadPrio");
     const s32 ov = overlayOf(c.r[3]);
@@ -170,6 +307,7 @@ HLE(DVDReadPrio) {
     s32 result = -1;
     const bool ok = destOk(c.r[4], c.r[5], "DVDReadPrio", c.lr);
     if (ok) sched::withCpuReleased([&] {
+        hostDelay();
         result = ov >= 0 ? ovRead(ov, hostp(c.r[4]), s32(c.r[5]), s32(c.r[6]))
                  : fi    ? DVDReadPrio(fi, hostp(c.r[4]), s32(c.r[5]), s32(c.r[6]), s32(c.r[7]))
                          : -1;
@@ -196,26 +334,34 @@ HLE(DVDReadAsyncPrio) {
         return;
     }
     watchRange(c.r[4], c.r[5], "DVDReadAsyncPrio");
-    s32 result = -1;
-    const bool ok = destOk(c.r[4], c.r[5], "DVDReadAsyncPrio", c.lr);
-    const auto read = [&] {
-        if (!ok) return;
-        result = ov >= 0 ? ovRead(ov, hostp(c.r[4]), s32(c.r[5]), s32(c.r[6]))
-                         : DVDReadPrio(fi, hostp(c.r[4]), s32(c.r[5]), s32(c.r[6]), s32(c.r[8]));
+    const u32 dst = c.r[4], len = c.r[5], off = c.r[6], prio = c.r[8];
+    const bool ok = destOk(dst, len, "DVDReadAsyncPrio", c.lr);
+    noteAsync(guest, off, len, c.lr);
+    const auto read = [ok, ov, fi, dst, len, off, prio]() -> s32 {
+        if (!ok) return -1;
+        hostDelay();
+        return ov >= 0 ? ovRead(ov, hostp(dst), s32(len), s32(off))
+                       : DVDReadPrio(fi, hostp(dst), s32(len), s32(off), s32(prio));
     };
-    // As in DVDReadPrio, a slow host read must not hold off interrupts. On the console this call
-    // returns at once, so with interrupts off (a caller's critical section) no other thread may
-    // run in it: then the read just happens in place.
-    // (sched::interruptsEnabled() is also false inside an interrupt handler.)
-    if (sched::interruptsEnabled()) sched::withCpuReleased(read);
-    else read();
-    wr32(guest + 0x0C, 1);  // busy until the completion interrupt
-    wr32(guest + 0x38, cb);
-    wr32(guest + 0x20, u32(result));
-    sched::postIrqAfter(readLatency(c.r[5]), [guest, cb, result](Ctx& ic) {
+    const auto complete = [guest, cb](Ctx& ic, s32 result) {
+        noteAsyncDone(guest);
+        wr32(guest + 0x20, u32(result));
         wr32(guest + 0x0C, 0);
         if (cb) guestCall(ic, cb, u32(result), guest);
-    });
+    };
+    wr32(guest + 0x0C, 1);  // busy until the completion interrupt
+    wr32(guest + 0x38, cb);
+    wr32(guest + 0x20, 0);
+    if (!oldAsyncPath()) {
+        driveQueue({guest, read, readLatency(len), complete});
+    } else {
+        // 1.1.5 and before (LM_DVD_ASYNC=old, A/B only): the read in the call, with the guest CPU
+        // released unless interrupts are off, so other guest code could run before it returned.
+        s32 result = -1;
+        if (sched::interruptsEnabled()) sched::withCpuReleased([&] { result = read(); });
+        else result = read();
+        sched::postIrqAfter(readLatency(len), [complete, result](Ctx& ic) { complete(ic, result); });
+    }
     c.r[3] = 1;
 }
 
