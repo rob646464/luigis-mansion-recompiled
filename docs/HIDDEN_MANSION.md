@@ -373,3 +373,15 @@ a setup-built overlay; scratch AppData/card, `LM_START_MAP=1` + `LM_SKIP_TEST` f
 the follow-up list shows both lines on screen; "(PAL)" gives the mirrored, darker mansion
 with `map2u` (US base) / the European data (European base); "(USA)" gives the unmirrored
 USA mansion (US base: retail data; European base: `usa/Map/map2.szp`).
+
+## The Japanese game
+
+The Japanese release (GLMJ01) has its own Hidden Mansion: the USA one (same rules data, same
+event scripts, no mirror) minus the two things the USA build added (docs/VERSION_DIFFERENCES.md
+section 2): Luigi's damage is not doubled (`fn_800B9680` does not exist; damage sites call
+`fn_800B9488(hp - dmg)` directly) and the small-heart threshold stays 100 in both modes
+(`fn_800E70BC` / `fn_800E7698` compare with a constant 100; USA 200/400). The flag
+(`0x804A0C40`, `r13+0x160`) is read by the GBH screen `fn_8003DF88`, the capture drain
+`fn_80081BCC` and the light-bind frames `fn_800DBE8C`, as in the other releases. On the
+Japanese base the port leaves it alone: no overlay, no flag hiding, no PAL rules
+(`hm::jpBase()`, `port::hiddenMansionPal/Us() == NotOnJpn`); F1 shows "the Japanese game's own".
