@@ -6,6 +6,7 @@
 #include "recomp/precache.h"
 #include "recomp/ui_scale.h"
 #include "setup/disc.h"
+#include "setup/disc_check.h"
 #include "setup/hm_overlay.h"
 #include "setup/module_builder.h"
 
@@ -16,6 +17,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -36,7 +39,30 @@ struct Slot {
     bool valid = false;
     GameVersion version = GameVersion::USA;
     std::string message;  // validation result
+    std::optional<DiscCheck> check;  // disc image check (disc_check.h); empty until it ran
 };
+
+// The disc image check of one slot, on a worker thread (reads the whole image once).
+struct CheckJob {
+    int slot = 0;
+    std::string path;
+    GameVersion version = GameVersion::USA;
+    std::atomic<float> fraction{0.0f};
+    std::atomic<bool> done{false}, cancel{false};
+    std::optional<DiscCheck> result;  // written before done
+    double seconds = 0.0;
+    std::thread thread;
+    ~CheckJob() {
+        cancel = true;
+        if (thread.joinable()) thread.join();
+    }
+};
+
+void logCheck(const Slot& s) {
+    if (s.check)
+        std::printf("[disc] %s image check: %s\n", s.version == GameVersion::PAL ? "European" : "USA",
+                    s.check->summary(8).c_str());
+}
 
 // State shared with the worker thread.
 struct Job {
@@ -89,7 +115,10 @@ void validate(Slot& s, GameVersion expected) {
         return;
     }
     s.valid = true;
+    s.version = v;
     s.message = v == GameVersion::PAL ? "Luigi's Mansion (Europe, GLMP01)" : "Luigi's Mansion (USA, GLME01)";
+    if (!discCheckEnabled()) s.check = DiscCheck{};
+    else if ((s.check = cachedDiscCheck(s.path, v))) logCheck(s);
 }
 
 struct Plan {
@@ -184,7 +213,7 @@ void browse(int slot, const std::string& current) {
                            dir.empty() ? nullptr : dir.c_str(), false);
 }
 
-enum class Screen { Pick, Working, Shaders, Failed };
+enum class Screen { Pick, Checking, Working, Shaders, Failed };
 
 }  // namespace
 
@@ -214,6 +243,13 @@ bool run(const Options& opts, LaunchInfo& launch) {
     bool started = false;
 
     auto begin = [&] {
+        // Playing with an image the check warned about: not asked again for this image.
+        for (int i = 0; i < 2; i++) {
+            if (slots[i].valid && slots[i].check && !slots[i].check->ok() && !slots[i].check->accepted) {
+                slots[i].check->accepted = true;
+                saveDiscCheck(slots[i].path, slots[i].version, *slots[i].check);
+            }
+        }
         inst.usDisc = slots[0].valid ? slots[0].path : "";
         inst.palDisc = slots[1].valid ? slots[1].path : "";
         inst.base = base;
@@ -225,8 +261,22 @@ bool run(const Options& opts, LaunchInfo& launch) {
         screen = Screen::Working;
         started = true;
     };
-    if (!showUi) begin();
-    else if (opts.autoStart && (slots[0].valid || slots[1].valid)) begin();
+    // Begin once every disc image is checked: at once when there is nothing to ask (or
+    // --setup-auto), unless the check finds a damaged or modified image the user has not
+    // chosen to play anyway: then the setup screen shows what differs (disc_check.h).
+    bool wantBegin = !showUi || (opts.autoStart && (slots[0].valid || slots[1].valid));
+    std::unique_ptr<CheckJob> check;
+    auto pendingCheck = [&]() -> int {
+        for (int i = 0; i < 2; i++)
+            if (slots[i].valid && !slots[i].check) return i;
+        return -1;
+    };
+    auto warned = [&] {
+        for (const Slot& s : slots)
+            if (s.valid && s.check && !s.check->ok() && !s.check->accepted) return true;
+        return false;
+    };
+    if (wantBegin && pendingCheck() >= 0) screen = Screen::Checking;
 
     port::setPhase("setup");
     bool finished = false;
@@ -247,6 +297,40 @@ bool run(const Options& opts, LaunchInfo& launch) {
                     validate(slots[i], i ? GameVersion::PAL : GameVersion::USA);
                     if (slots[i].valid && !slots[1 - i].valid) base = slots[i].version;
                     chooseBase();
+                }
+            }
+        }
+        if (check && check->done) {
+            Slot& s = slots[check->slot];
+            if (check->result && s.valid && s.path == check->path) {
+                s.check = check->result;
+                saveDiscCheck(s.path, s.version, *s.check);
+                logCheck(s);
+                std::printf("[disc] (image read in %.1f s; cached until the file changes)\n", check->seconds);
+            }
+            check.reset();
+        }
+        if (!check && (screen == Screen::Pick || screen == Screen::Checking)) {
+            if (const int i = pendingCheck(); i >= 0) {
+                check = std::make_unique<CheckJob>();
+                CheckJob* cj = check.get();
+                cj->slot = i;
+                cj->path = slots[i].path;
+                cj->version = slots[i].version;
+                cj->thread = std::thread([cj] {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    cj->result = checkDiscFiles(cj->path, cj->version, &cj->cancel,
+                                                [cj](float f) { cj->fraction = f; });
+                    cj->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    cj->done = true;
+                });
+            } else if (screen == Screen::Checking || wantBegin) {
+                wantBegin = false;
+                if (warned() && !opts.autoStart) {
+                    showUi = true;
+                    screen = Screen::Pick;
+                } else {
+                    begin();
                 }
             }
         }
@@ -330,6 +414,17 @@ bool run(const Options& opts, LaunchInfo& launch) {
                     ImGui::SameLine();
                     if (slots[i].valid) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1), "%s", slots[i].message.c_str());
                     else ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "%s", slots[i].message.c_str());
+                    if (slots[i].valid && check && check->slot == i) {
+                        ImGui::TextDisabled("Checking the disc image... %d%%", int(check->fraction * 100.0f));
+                    } else if (slots[i].valid && slots[i].check && !slots[i].check->ok()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.4f, 1));
+                        ImGui::TextWrapped(
+                            "Warning: this disc image is damaged or modified. %s. The game will probably crash "
+                            "(for example after START on the title screen). Make a new dump of your disc, or check "
+                            "this one in Dolphin (right-click the game > Properties > Verify).",
+                            slots[i].check->summary().c_str());
+                        ImGui::PopStyleColor();
+                    }
                 }
                 ImGui::Dummy(ImVec2(0, 8 * scale));
                 ImGui::PopID();
@@ -351,8 +446,8 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 ImGui::TextDisabled("Both versions are prepared; you can switch later in the F1 menu (Game tab).");
             }
             ImGui::Dummy(ImVec2(0, 8 * scale));
-            ImGui::BeginDisabled(!(slots[0].valid || slots[1].valid));
-            if (ImGui::Button(started ? "Continue" : "Install and play")) begin();
+            ImGui::BeginDisabled(!(slots[0].valid || slots[1].valid) || check || pendingCheck() >= 0);
+            if (ImGui::Button(started ? "Continue" : warned() ? "Play anyway" : "Install and play")) begin();
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Quit")) {
@@ -360,6 +455,10 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 aurora_end_frame();
                 return false;
             }
+        } else if (screen == Screen::Checking) {
+            ImGui::TextWrapped("Checking the disc image. This happens once per disc image.");
+            ImGui::Dummy(ImVec2(0, 8 * scale));
+            ImGui::ProgressBar(check ? check->fraction.load() : 0.0f, ImVec2(-1, 0));
         } else {
             std::string stage, error;
             float f = 0.0f;
@@ -416,6 +515,10 @@ bool run(const Options& opts, LaunchInfo& launch) {
     launch.version = base;
     launch.disc = slots[base == GameVersion::PAL ? 1 : 0].path;
     launch.module = modulePath(base);
+    {
+        const Slot& s = slots[base == GameVersion::PAL ? 1 : 0];
+        inst.discProblem = s.check && !s.check->ok() ? "the disc image is damaged or modified: " + s.check->summary(6) : "";
+    }
     return true;
 }
 

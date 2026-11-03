@@ -3,6 +3,7 @@
 #include "recomp/interp.h"
 #include "recomp/runtime.h"
 #include "recomp/sched.h"
+#include "port/install.h"
 #include "port/recovery.h"
 
 #include <dolphin/gx.h>
@@ -237,7 +238,12 @@ void fatal(const char* fmt, ...) {
     va_copy(copy, ap);
     std::vsnprintf(buf, sizeof(buf), fmt, copy);
     va_end(copy);
-    port::recovery::noteFatal(buf);
+    {
+        // Into the recovery state too, so the next start's "[recovery] ... crash" line says it.
+        std::string note = buf;
+        if (const std::string& disc = port::install().discProblem; !disc.empty()) note += "; probable cause: " + disc;
+        port::recovery::noteFatal(note.c_str());
+    }
     if (port::recovery::runLog()) {
         const std::string line = std::string("[recomp FATAL] ") + buf;
         port::recovery::logLine(line.c_str(), line.size());
@@ -246,6 +252,12 @@ void fatal(const char* fmt, ...) {
     std::vfprintf(stderr, fmt, ap);
     va_end(ap);
     std::fputc('\n', stderr);
+    // A damaged or modified disc image is the likely cause then (setup's disc check, issue #37).
+    if (const std::string& disc = port::install().discProblem; !disc.empty()) {
+        const std::string line = "[recomp FATAL] probable cause: " + disc;
+        if (port::recovery::runLog()) port::recovery::logLine(line.c_str(), line.size());
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
     dumpTraceRing();
     std::fflush(stderr);
     std::abort();
