@@ -3,6 +3,7 @@
 #include <aurora/aurora.h>
 #include <aurora/dvd.h>
 #include <aurora/event.h>
+#include <aurora/input.hpp>
 #include <aurora/main.h>
 #include <aurora/present_timing.h>
 #include <dolphin/dvd.h>
@@ -299,6 +300,13 @@ int main(int argc, char* argv[]) {
     cpu::init();  // thread policy + Aurora thread hooks (issue #18), before Aurora starts its threads
     aurora_initialize(argc, argv, &config);
     mem::trackInit();  // LM_MEM_TRACK (test aid, docs/RENDERING.md "Memory use over time")
+    // The mouse cursor hides after two seconds without mouse input over the game and comes back when the mouse
+    // moves (Aurora's AutoHide). The F1 menu's layer sits above this one, so it keeps the cursor while it has the mouse.
+    aurora::input::register_layer({
+        .label = "game cursor",
+        .onEvent = [](const aurora::input::InputEvent&, void*) { return aurora::input::EventResult::Pass; },
+        .pointerMode = [](void*) { return aurora::input::PointerMode::AutoHide; },
+    });
     if (topmost)
         if (SDL_Window* w = aurora_get_window()) SDL_SetWindowAlwaysOnTop(w, true);
     // LM_OFFSCREEN=1 (testing: automated runs on a machine someone is using): the window is moved far
