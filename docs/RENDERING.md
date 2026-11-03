@@ -3278,9 +3278,11 @@ compiled (the biggest, a few GB after a cold start).
 ### Measuring
 
 - **`[mem]` lines** in the log (last_run.log) every 60 s (`LM_MEM_LOG=<s>`, 0 = off;
-  `src/recomp/mem_report.cpp`): the process's private bytes, the bytes allocated in the C/C++ heaps
-  (Windows `HeapSummary`; the rest of private is guest memory, thread stacks and the graphics
-  driver's own allocations), working set and peak, the GPU memory the process uses (DXGI per-process
+  `src/recomp/mem_report.cpp`, written by its own low-priority thread since issue #43, see
+  "The once-a-minute freeze" below): the process's private bytes, working set and peak, the bytes
+  allocated in the C/C++ heaps only with `LM_MEM_HEAPS=1` or `LM_MEM_TRACK` (Windows `HeapSummary`,
+  which stalls the game for most of a second; the rest of private is guest memory, thread stacks and
+  the graphics driver's own allocations), the GPU memory the process uses (DXGI per-process
   local / non-local usage); then Aurora's cache sizes (`aurora_mem_stats`, 0250: live textures with
   bytes, texture object / content / TLUT caches, EFB copy textures and the copy-texture cache with
   bytes, bind groups, samplers, pipelines, shader modules, EFB copy-to-RAM entries and byte buffers)
@@ -3387,3 +3389,35 @@ at Original 30 (key-door route of "Original 30", `LM_DVD_SPEED=1`, frames 2950-4
 all 30 byte-identical between the build before and after. (A second run of the old build differs
 from the first in 13 frames of that route, late in it: the route is not fully deterministic, so a
 single identical pair is the stronger result.)
+
+### The once-a-minute freeze (issue #43, branch `issue43-stutter`)
+
+Report (1.1.5 only; 1.1.4 fine): every 60-90 s the game froze for most of a second, sound included
+(3-4 stutters, the FPS counter down to 3-32 with "PC too slow"), then went on; not tied to anything
+the player did. Reporters at 3440x1440 165 Hz and 4K 160 Hz with Enhanced lighting.
+
+Cause: the `[mem]` report added in 1.1.5 for issue #34. It ran on the host (frame) thread every
+60 s, and its C/C++ heap total used `HeapSummary`, which walks every block of each process heap
+while holding that heap's lock: **835-880 ms** here (Enhanced lighting Ultra, 4K, heaps ~1.1 GB;
+the reporters' heaps were 1.4 GB). The host thread presented nothing meanwhile, and every other
+thread that allocated (render worker, Dawn, the driver, the guest's HLE calls) waited on the heap
+lock, so the guest and its audio mix stopped too (`[audio] device queue ran dry`). The reporters'
+logs show it exactly: one present interval of 400-970 ms right after each `[mem]` line, `hitches 1`
+in every `[perf]` minute, `render worker ... max 430-437 ms`.
+
+Fix: the heap total is no longer taken by default (only with `LM_MEM_HEAPS=1` or `LM_MEM_TRACK`,
+knowing it stalls); the report runs on its own low-priority thread (the host thread only wakes it);
+the DXGI adapters for the GPU memory figures are enumerated once instead of every report. A report
+that takes over 20 ms says so (`[mem] report took N ms (sampler thread)`; the first one can, while
+DXGI loads).
+
+Measured (lmrecomp, 4K window, Enhanced lighting Ultra settings, `mixed` pacing scenario; the
+machine was shared with several other game instances, so the frame rates themselves are low and
+noisy): before, intervals of 849 / 914 / 971 / 960 / 912 ms within 0.3 s of each of the five
+`[mem]` reports (run p99 58 ms); after, at 165 fps for 11 minutes the longest interval within 3 s
+of each of the eleven reports is 56-183 ms, below or near that run's p99 (133 ms), and no interval
+over 300 ms anywhere near a report; at 120 fps for 11 minutes 16-158 ms (p99 115 ms). Private bytes
+flat (3555-3598 MB at 165, 3616-3727 MB at 120), so the #34 fixes are unchanged. The other periodic
+work new in 1.1.5 is small: the GXTexObj table collection (every ~19 s, `LM_OBJ_TABLE_LOG=1`) takes
+9-22 ms on the guest thread (inside a 33 ms game frame); Aurora's copy-texture sweep (every 64 frames)
+was not measured separately, and neither shows as a stall in the pacing logs.

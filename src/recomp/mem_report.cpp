@@ -5,8 +5,13 @@
 
 #include <aurora/mem_stats.h>
 
+#include <SDL3/SDL_thread.h>
+
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,24 +55,45 @@ void gpuUsage(Proc& p) {
         return f;
     }();
     if (!sFactory) return;
+    // The adapters are enumerated once (issue #43: no driver enumeration every report).
+    static IDXGIAdapter3* sAdapters[8] = {};
+    static UINT sCount = [] {
+        UINT n = 0;
+        IDXGIAdapter1* a = nullptr;
+        for (UINT i = 0; n < 8 && sFactory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+            IDXGIAdapter3* a3 = nullptr;
+            if (SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3)))) sAdapters[n++] = a3;
+            a->Release();
+        }
+        return n;
+    }();
     double local = 0, shared = 0;
     bool any = false;
-    IDXGIAdapter1* a = nullptr;
-    for (UINT i = 0; sFactory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-        IDXGIAdapter3* a3 = nullptr;
-        if (SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3)))) {
-            DXGI_QUERY_VIDEO_MEMORY_INFO l{}, n{};
-            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &l)) &&
-                SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &n))) {
-                local += double(l.CurrentUsage) / (1024.0 * 1024.0);
-                shared += double(n.CurrentUsage) / (1024.0 * 1024.0);
-                any = true;
-            }
-            a3->Release();
+    for (UINT i = 0; i < sCount; i++) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO l{}, n{};
+        if (SUCCEEDED(sAdapters[i]->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &l)) &&
+            SUCCEEDED(sAdapters[i]->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &n))) {
+            local += double(l.CurrentUsage) / (1024.0 * 1024.0);
+            shared += double(n.CurrentUsage) / (1024.0 * 1024.0);
+            any = true;
         }
-        a->Release();
     }
     if (any) p.gpuLocalMb = local, p.gpuSharedMb = shared;
+}
+
+// Issue #43: HeapSummary walks every block of a heap while holding that heap's lock: 0.8-0.9 s
+// for the ~1.1-1.4 GB the game's heaps hold at 4K with Enhanced lighting, during which every thread
+// that allocates (render worker, Dawn, the driver, the guest's HLE calls) waits. Done every 60 s on
+// the host thread in 1.1.5, it froze the game and its sound for most of a second once a minute.
+// So the heap total is only taken on request (LM_MEM_HEAPS=1, or with LM_MEM_TRACK), knowing it
+// stalls the game for that long.
+bool heapsWanted() {
+    static const bool s = [] {
+        const char* h = std::getenv("LM_MEM_HEAPS");
+        const char* t = std::getenv("LM_MEM_TRACK");
+        return (h && *h == '1') || (t && (*t == '1' || *t == '2'));
+    }();
+    return s;
 }
 
 // C/C++ heaps (malloc/new of the game, Aurora, Dawn, SDL): bytes allocated in the process heaps.
@@ -108,7 +134,7 @@ Proc sample() {
         p.peakMb = double(c.PeakWorkingSetSize) / (1024.0 * 1024.0);
     }
     gpuUsage(p);
-    heapUsage(p);
+    if (heapsWanted()) heapUsage(p);
 #elif defined(__APPLE__)
     task_vm_info_data_t vm{};
     mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
@@ -132,18 +158,9 @@ Proc sample() {
     return p;
 }
 
-}  // namespace
-
-void report() {
-    static const double sEvery = [] { const char* e = std::getenv("LM_MEM_LOG"); return e ? std::atof(e) : 60.0; }();
-    if (sEvery <= 0) return;
-    static const Clock::time_point sStart = Clock::now();
-    static Clock::time_point sLast = sStart;
-    const auto now = Clock::now();
-    if (std::chrono::duration<double>(now - sLast).count() < sEvery) return;
-    sLast = now;
+void writeReport(double t) {
+    const auto t0 = Clock::now();
     const Proc p = sample();
-    const double t = std::chrono::duration<double>(now - sStart).count();
     char gpu[96] = "", heap[48] = "";
     if (p.gpuLocalMb >= 0) std::snprintf(gpu, sizeof(gpu), ", GPU local %.0f MB, GPU shared %.0f MB", p.gpuLocalMb, p.gpuSharedMb);
     if (p.heapMb >= 0) std::snprintf(heap, sizeof(heap), ", heaps %.0f MB", p.heapMb);
@@ -166,6 +183,53 @@ void report() {
     gxObjectTables(tex, texFree, tlut, tlutFree);
     log("[mem] port: texture objects %u (%u free), TLUT objects %u (%u free)", tex, texFree, tlut, tlutFree);
     trackReport();
+    // Issue #43: what the report cost (on its own thread; the game does not wait for it).
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    if (ms > 20.0) log("[mem] report took %.0f ms (sampler thread)", ms);
+}
+
+// Issue #43: the report runs on its own low-priority thread, never on the host (frame) thread: even
+// a millisecond there is a late frame at 165 fps. The host thread only wakes it.
+std::mutex sMutex;
+std::condition_variable sWake;
+bool sPending = false;
+double sPendingT = 0;
+
+void samplerThread() {
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    for (;;) {
+        double t;
+        {
+            std::unique_lock lock{sMutex};
+            sWake.wait(lock, [] { return sPending; });
+            sPending = false;
+            t = sPendingT;
+        }
+        writeReport(t);
+    }
+}
+
+}  // namespace
+
+void report() {
+    static const double sEvery = [] { const char* e = std::getenv("LM_MEM_LOG"); return e ? std::atof(e) : 60.0; }();
+    if (sEvery <= 0) return;
+    static const Clock::time_point sStart = Clock::now();
+    static Clock::time_point sLast = sStart;
+    const auto now = Clock::now();
+    if (std::chrono::duration<double>(now - sLast).count() < sEvery) return;
+    sLast = now;
+    static const bool sStarted = [] {
+        std::thread(samplerThread).detach();  // waits on sWake for the rest of the run
+        return true;
+    }();
+    (void)sStarted;
+    {
+        std::lock_guard lock{sMutex};
+        sPending = true;
+        sPendingT = std::chrono::duration<double>(now - sStart).count();
+    }
+    sWake.notify_one();
 }
 
 }  // namespace recomp::mem
