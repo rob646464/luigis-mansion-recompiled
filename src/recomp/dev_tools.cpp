@@ -319,7 +319,7 @@ HLE(LMChangeFrameBuffer__Fv) {
     static const int sEnvFont = envInt("LM_DEV_FONT_TEST", -1);
     const int font = sEnvFont >= 0 ? sEnvFont : (e.dbgFontTest ? (e.dbgFontTestLatin ? 2 : 1) : 0);
     wr16(kFontTestFlag, font ? 1 : 0);
-    if (!ver::pal()) wr32(kFontTestLine11, font == 2 ? kFontTestLatin : kFontTestLine11Orig);
+    if (ver::usa()) wr32(kFontTestLine11, font == 2 ? kFontTestLatin : kFontTestLine11Orig);
 
     // Test aid: LM_DEV_WARPS=<map>[:<appear>]@<frame>,... queues warps at given frame counts.
     static std::vector<std::array<int, 3>> sEnvWarps = [] {
@@ -511,8 +511,8 @@ void unusedSection() {
     ImGui::TextDisabled("Leftover room models. Go warps to the retail room and shows the old model\n"
                         "for that visit only.");
     // Its hooks (Luigi's start position for the visited room) are written against the USA code.
-    const bool roomsHere = !ver::pal();
-    if (!roomsHere) ImGui::TextDisabled("(%s)", port::availNote(port::Avail::NotYet));
+    const bool roomsHere = ver::usa();
+    if (!roomsHere) ImGui::TextDisabled("(%s)", port::availNote(ver::pal() ? port::Avail::NotYet : port::Avail::NotOnJpn));
     ImGui::BeginDisabled(!sStatus.inGame || !roomsHere);
     int nr = 0;
     const rooms::LeftoverRoom* lr = rooms::list(&nr);
@@ -567,11 +567,11 @@ void debugSection() {
     dirty |= recomp::menu::Checkbox("Font test", &e.dbgFontTest);
     helpMarker("Twelve lines of kanji / kana / symbols printed with the game font (flag 0x804D8488;\n"
                "PAL code 0A4B8590 0201 / 024C5B58 0001).");
-    ImGui::BeginDisabled(!e.dbgFontTest || ver::pal());
+    ImGui::BeginDisabled(!e.dbgFontTest || !ver::usa());
     ImGui::SameLine();
     dirty |= recomp::menu::Checkbox("Latin last line (PAL fix)", &e.dbgFontTestLatin);
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("%s", ver::pal() ? "The European version's font test already prints Latin lines."
+    ImGui::SetItemTooltip("%s", !ver::usa() ? "Only on the USA version (the European font test already prints Latin lines)."
                                            : "The font test's last line prints \"alphabet 123\" in Latin letters, as the\n"
                                              "European version does. Needs \"Font test\".");
     if (dirty) port::saveSettings();

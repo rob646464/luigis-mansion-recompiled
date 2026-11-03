@@ -18,7 +18,7 @@ struct LaunchInfo {
 struct Options {
     bool forceUi = false;   // --setup: show the setup screen even if everything is ready
     bool autoStart = false; // --setup-auto: start installing without waiting for a click (testing)
-    std::string usDisc, palDisc;  // --us-disc / --pal-disc: prefill the disc pickers
+    std::string usDisc, palDisc, jpnDisc;  // --us-disc / --pal-disc / --jpn-disc: prefill the disc pickers
 };
 
 // Requires an initialised Aurora window (the UI is Dear ImGui). Returns false if the user

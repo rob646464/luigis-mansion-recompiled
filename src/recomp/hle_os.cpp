@@ -26,11 +26,14 @@ namespace {
 // .ctors (null-terminated function pointer list): `_ctors` in decomp/config/*/symbols.txt.
 constexpr u32 kCtorsStartUs = 0x8020BAC0;
 constexpr u32 kCtorsStartPal = 0x80210AA0;
+constexpr u32 kCtorsStartJp = 0x80200C80;
 // FST max length from each disc's boot.bin (+0x42C), for the console's arena high (OSInit).
 constexpr u32 kFstMaxUs = 0x5179;
 constexpr u32 kFstMaxPal = 0x5563;
+constexpr u32 kFstMaxJp = 0x4EB9;
 
 bool palGame() { return port::install().running == port::GameVersion::PAL; }
+bool jpGame() { return port::install().running == port::GameVersion::JPN; }
 
 // Initial stack pointer from __init_registers (`lis r1, hi; ori r1, r1, lo`). The arena
 // starts just above the stack, where the linker put __ArenaLo (US: 0x804ED940).
@@ -49,7 +52,8 @@ void setBool(Ctx& c, bool v) { c.r[3] = v ? 1 : 0; }
 // --- boot -------------------------------------------------------------------
 
 HLE(__init_cpp) {
-    for (u32 p = palGame() ? kCtorsStartPal : kCtorsStartUs; rd32(p) != 0; p += 4) guestCall(c, rd32(p));
+    for (u32 p = palGame() ? kCtorsStartPal : jpGame() ? kCtorsStartJp : kCtorsStartUs; rd32(p) != 0; p += 4)
+        guestCall(c, rd32(p));
 }
 HLE(__init_user) { hle___init_cpp(c); }
 HLE(_ExitProcess) {
@@ -78,7 +82,7 @@ HLE(OSInit) {
     // decompression buffer and the decompressor wrote 320 KiB at address 0 (low memory, the bus
     // clock: the European game's frame alarm then fired at once). Host-made guest objects
     // (hleAlloc) live above MEM1 instead (runtime.cpp).
-    const u32 fstMax = palGame() ? kFstMaxPal : kFstMaxUs;
+    const u32 fstMax = palGame() ? kFstMaxPal : jpGame() ? kFstMaxJp : kFstMaxUs;
     const u32 arenaHi = (0x81800000u - fstMax) & ~31u;
     wr32(0x80000034, arenaHi);  // arena high
     wr32(0x80000038, arenaHi);  // FST location (the FST itself is not in guest memory: DVD is HLE)

@@ -8,19 +8,23 @@
 
 namespace port {
 
-enum class GameVersion { USA, PAL };  // GLME01 / GLMP01
+enum class GameVersion { USA, PAL, JPN };  // GLME01 / GLMP01 / GLMJ01
+constexpr int kGameVersions = 3;
 
-const char* gameId(GameVersion v);         // "GLME01" / "GLMP01"
-const char* versionName(GameVersion v);    // "USA" / "PAL"
+const char* gameId(GameVersion v);         // "GLME01" / "GLMP01" / "GLMJ01"
+const char* versionName(GameVersion v);    // "USA" / "PAL" / "JPN" (install.ini, logs)
+const char* regionName(GameVersion v);     // "USA" / "Europe" / "Japan" (shown to the player)
 
 struct InstallState {
     std::string usDisc;   // path to the user's US disc image (ISO/RVZ/...), empty if none
     std::string palDisc;  // path to the PAL disc image, empty if none
-    GameVersion base = GameVersion::USA;  // which version runs (when both are installed)
+    std::string jpnDisc;  // path to the Japanese disc image, empty if none
+    GameVersion base = GameVersion::USA;  // which version runs (when several are installed)
 
     // Filled at startup from the setup results (not persisted).
     bool usReady = false;    // US game module built and current
     bool palReady = false;   // PAL game module built and current
+    bool jpnReady = false;   // Japanese game module built and current
     bool hmOverlayReady = false;  // PAL Hidden Mansion overlay for the US base (needs both discs)
     GameVersion running = GameVersion::USA;  // version of the game that is running
 
@@ -29,23 +33,34 @@ struct InstallState {
     // "Disc image check"): one line naming them, for crash reports. Empty: matches, or not checked.
     std::string discProblem;
 
-    bool both() const { return usReady && palReady; }
+    bool both() const { return usReady && palReady; }  // USA + European: the Hidden Mansion overlays
+    bool ready(GameVersion v) const {
+        return v == GameVersion::PAL ? palReady : v == GameVersion::JPN ? jpnReady : usReady;
+    }
+    const std::string& disc(GameVersion v) const {
+        return v == GameVersion::PAL ? palDisc : v == GameVersion::JPN ? jpnDisc : usDisc;
+    }
+    int readyCount() const { return int(usReady) + int(palReady) + int(jpnReady); }
 };
 
 // Feature availability for the F1 menu (docs/SETUP.md, "Feature gating"). Only a
-// single-disc install greys features out; with both discs everything stays selectable and
-// options for the other version say where they apply.
+// single-disc install greys features out; with several discs everything stays selectable and
+// options for another version say where they apply.
 enum class Avail {
     Yes,           // works in the running game
-    OtherBase,     // works when the other version is the base (both discs installed)
-    NeedsUsDisc,   // single-disc install without the USA disc
-    NeedsPalDisc,  // single-disc install without the European disc
+    OtherBaseUs,   // works when the USA version is the base (its disc is installed)
+    OtherBasePal,  // works when the European version is the base (its disc is installed)
+    NeedsUsDisc,   // install without the USA disc
+    NeedsPalDisc,  // install without the European disc
     NotYet,        // both discs installed, but not implemented for the running base yet
+    NotOnJpn,      // not available on the Japanese version (yet)
 };
 Avail usCodeFeature();      // enhancements written against the USA game's code/addresses
 Avail palBaseFeature();     // 50/60 Hz, language: options of the European game itself
 Avail hiddenMansionPal();   // the European Hidden Mansion rules
 Avail hiddenMansionUs();    // the USA Hidden Mansion rules
+Avail notOnJpn();           // Yes on the USA / European game, NotOnJpn on the Japanese one
+bool availGreyed(Avail a);  // the option cannot be used in this install (vs. applies elsewhere)
 const char* availNote(Avail a);  // short explanation, nullptr for Yes
 
 InstallState& install();

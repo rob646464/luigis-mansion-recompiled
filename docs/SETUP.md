@@ -26,13 +26,24 @@ The LLVM binaries are copied at install time, never committed. Toolchain lookup 
 ## Setup flow
 
 1. **Pick discs.** The setup screen (Dear ImGui on the Aurora window; SDL3
-   `SDL_ShowOpenFileDialog` for browsing) has a slot for the USA disc (GLME01) and one for
-   the European disc (GLMP01). Any image nod reads works (ISO/GCM, RVZ, WIA, GCZ, CISO,
-   WBFS, NFS, TGC). Each pick is validated at once (`setup/disc.cpp`): the image is
-   opened with nod and the SHA-1 of its `main.dol` must match a supported retail build
-   (`port::dol::identify`, hashes from `decomp/config/*/build.sha1`). A disc in the wrong
-   slot, another game or another revision gets a message.
-   One disc is enough; with both, the user picks the version to play (default USA).
+   `SDL_ShowOpenFileDialog` for browsing) has a slot for the USA disc (GLME01), one for
+   the European disc (GLMP01) and one for the Japanese disc (GLMJ01). Any image nod reads
+   works (ISO/GCM, RVZ, WIA, GCZ, CISO, WBFS, NFS, TGC). Each pick is validated at once
+   (`setup/disc.cpp`): the image is opened with nod and the SHA-1 of its `main.dol` must
+   match a supported retail build (`port::dol::identify`, hashes from
+   `decomp/config/*/build.sha1`; Japan: the user's dump, *The Japanese game* below). A disc
+   in the wrong slot, another game or another revision gets a message.
+   One disc is enough; with several, the user picks the version to play (default USA).
+
+   | Release | Game ID | Revision | main.dol SHA-1 | Function table | Version map | `install.ini` | Memory cards |
+   |---------|---------|----------|----------------|----------------|-------------|---------------|--------------|
+   | USA | GLME01 | 0 | `77d49225e7d28b9777916cdbe5809345c570ecbc` | `decomp/config/GLME01` (decomp, with TU splits) | - (USA names are canonical) | `us_disc` | `USA/Card A` |
+   | Europe | GLMP01 | 0 | `a1e2bd82813787cfe0b11afb5d138f08fdbd94f1` | `decomp/config/GLMP01_00` (decomp) | `tools/recomp/GLMP01_map.txt`, `version_addrs.inc` | `pal_disc` | `EUR/Card A` |
+   | Japan | GLMJ01 | 0 | `722005ea9c1eab54b114f814734d8f327e5614ee` | `decomp/config/GLMJ01` (decomp-toolkit, `tools/recomp/gen_jp_symbols.py`) | `tools/recomp/GLMJ01_map.txt`, `version_addrs_jp.inc` | `jpn_disc` | `JAP/Card A` |
+
+   `install.ini` also keeps `base=USA|PAL|JPN` (the version that runs) and, in portable
+   mode, `*_disc_rel`. The memory card folder follows the game ID's region letter (Aurora's
+   card layer), so each release keeps its own saves.
 2. **Install** (worker thread, progress bar, cancellable):
    - For each disc whose game module is missing or stale: recompile its `main.dol`
      (`src/recompiler`, in-process), write the 32 generated sources plus the shipped
@@ -616,17 +627,74 @@ hidden call (an interrupt waking a higher-priority thread) lets that thread see 
 value too; only flag readers with USA hidden-mansion behaviour could be affected, and the
 ones found are all on the main game thread.
 
+## The Japanese game (GLMJ01)
+
+The Japanese release (rev 0, the first build, September 2001) is the third supported base. Its
+code is close to the USA game: of 10,984 USA functions, 10,688 have an identical fingerprint in
+the Japanese DOL, 186 differ (145 modified, 22 constants, 19 struct layout only), 110 are USA
+only (the HVQM4 decoder and stream player of the Pikmin movie, which the Japanese disc does not
+have, `fn_800B9680` damage x2, the debugger driver's newer SDK, a few game functions).
+
+- **Function table.** The decomp has no Japanese config, so `decomp/config/GLMJ01/symbols.txt`
+  comes from decomp-toolkit (`dtk dol split`, encounter/decomp-toolkit, MIT, a dev-only tool,
+  not in the repo): `python tools/recomp/gen_jp_symbols.py --dtk <dtk.exe>`. On the USA DOL dtk
+  finds the same 10,984 function starts and sizes as the curated decomp table except four
+  assembly/padding cases (it ends `Run`, `PSVECSquareMag`, `List_AddChannelTail`,
+  `countUniqueMaterials` early and makes the tail a separate function); the script merges
+  those back the same way on the Japanese table (10,886 functions).
+- **Version map.** `python tools/recomp/gen_version_map.py --target jp` (or `--target all`):
+  `tools/recomp/GLMJ01_map.txt` (SDK units for the HLE, USA names, hooks) and
+  `src/recomp/version_addrs_jp.inc` (every `VA()` address: all 137 map). `pal_diff.py --jp`
+  runs every comparison command against the Japanese game. The module cache key covers the
+  map, so committed changes rebuild users' Japanese modules.
+- **Hooks.** `jp` tag in `hooks.txt` (`<symbol> us pal jp`), `jpfn_<addr>` for Japanese-only
+  functions; the recompiler fails on a `jp` hook the Japanese build does not have.
+  Every `us pal` hook is tagged `jp` except the HVQM hooks and `fn_8005582C` (not in the
+  Japanese game) and the European Hidden Mansion tuning hooks whose functions the Japanese game
+  changed (`fn_800B41E0`, `fn_8009FD54`, `fn_800E70BC`, `fn_800E7698`). The instruction patches
+  have `jp` lines (same instruction, same original word, all in unchanged functions).
+- **Offsets.** `VOFF(usa, european)` gives the USA offset on the Japanese game: checked with
+  `pal_diff.py --jp field` for the camera (+0x18C, +0x1EC, +0x1F4), Luigi (+0xFC .. +0x1350)
+  and the heart sprites. Where the layout differs: `VOFF3(usa, european, japanese)` (the bill
+  gravity `r13-0x1968`, the size of `fn_800AEEA8` for the damage hook). The Japanese HUD/menu
+  classes are 4-44 bytes smaller (no hook reads them).
+- **Code paths.** `ver::usa()` / `ver::jpn()` / `ver::pal()`; code on raw USA addresses checks
+  `ver::usa()` (not `!ver::pal()`). Boot values: `.ctors` 0x80200C80, FST max 0x4EB9 (arena end
+  0x817FB140), `VI_NTSC`. Text and fonts are the game's own (`JUTResFont` from the disc, Shift-JIS):
+  nothing to do. Memory cards go to `JAP/Card A`.
+- **Hidden Mansion.** The Japanese game has its own (docs/HIDDEN_MANSION.md "The Japanese
+  game"): the USA rules minus damage x2 and the raised heart threshold. The European/USA
+  two-variant overlays and flag-hiding hooks are not applied on the Japanese base
+  (`port::hiddenMansionPal/Us` = `NotOnJpn`, `hm::jpBase()`); with more discs, E. Gadd's lab
+  offers every release's mansion and the USA / Japanese Hidden Mansions there
+  (docs/VERSION_DIFFERENCES.md section 6; the European Hidden Mansion on the Japanese base: not yet).
+- **Not on the Japanese base yet** (F1 greys them, "not available on the Japanese version yet"):
+  Mirrored Mansion (its USA-game hooks), leftover-room visits, the font test's Latin line. The
+  Pikmin movie does not exist there.
+- **Disc check.** `src/setup/disc_files_GLMJ01.inc` (path, size, CRC-32 of the 820 files, from
+  the user's dump with branch issue37-crash's `tools/gen_disc_files.py`) is ready for that
+  branch's per-file check; the dump was not verified against redump.
+
+Verified (lmrecomp `LM_DOL_VERSION=GLMJ01` and LuigisMansionRecomp setup with only the Japanese
+disc: module built in 19.9 s): title, file select (Japanese), opening, foyer with the HUD,
+audio (music and effects in the AI stream), widescreen 16:9 (Hor+, HUD), frame interpolation
+(57 fps presented on a 60 Hz display, game 30), Enhanced lighting Ultra, 0 shader misses with
+the USA caches.
+
 ## Feature gating (F1 menu)
 
 `port::Avail` (`src/port/install.h`):
 
-| Feature | USA base | European base |
-|---------|----------|---------------|
-| Skippable cutscenes, HUD at screen edges, widescreen culling, GBH camera/clock/tracker, ghost shading, unused content, gameplay options, debug tools | yes | yes |
-| Leftover-room visits (Unused content > Unused rooms) | yes | *not available on the European version yet* |
-| Hidden Mansion: European rules | with both discs (overlay) | native |
-| Hidden Mansion: USA rules | native | with both discs (reverse overlay) |
-| PAL refresh rate, language | *European version only* (greyed on a USA-only install) | yes |
+| Feature | USA base | European base | Japanese base |
+|---------|----------|---------------|---------------|
+| Skippable cutscenes, HUD at screen edges, widescreen culling, GBH camera/clock/tracker, ghost shading, unused content, gameplay options, debug tools | yes | yes | yes |
+| Leftover-room visits (Unused content > Unused rooms) | yes | *not available on the European version yet* | *not available on the Japanese version yet* |
+| Mirrored Mansion | yes | yes | *not available on the Japanese version yet* |
+| Hidden Mansion: European rules | with both discs (overlay) | native | not yet |
+| Hidden Mansion: USA rules | native | with both discs (reverse overlay) | with the USA disc (versions overlay) |
+| Hidden Mansion: Japanese rules | with the Japanese disc (versions overlay) | with the Japanese disc | native |
+| The Mansion: another release's rules (docs/VERSION_DIFFERENCES.md section 6) | with its disc | with its disc | with its disc |
+| PAL refresh rate, language | *European version only* (greyed on a USA-only install) | yes | *European version only* |
 
 Rules: a single-disc install greys out what needs the other disc, with the reason
 ("needs the European disc: F1 > Game > Add or change discs"). With both discs nothing is

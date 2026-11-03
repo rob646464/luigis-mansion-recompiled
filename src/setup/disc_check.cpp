@@ -24,12 +24,16 @@ constexpr RetailFile kFilesGLME01[] = {
 constexpr RetailFile kFilesGLMP01[] = {
 #include "setup/disc_files_GLMP01.inc"
 };
+constexpr RetailFile kFilesGLMJ01[] = {
+#include "setup/disc_files_GLMJ01.inc"
+};
 
 // Bump when the tables or the cache format change.
 constexpr const char* kCacheFormat = "disc-check 1";
 
 std::span<const RetailFile> retailFiles(port::GameVersion v) {
     if (v == port::GameVersion::PAL) return kFilesGLMP01;
+    if (v == port::GameVersion::JPN) return kFilesGLMJ01;
     return kFilesGLME01;
 }
 

@@ -392,7 +392,7 @@ struct Gate {
     port::Avail a;
     explicit Gate(port::Avail avail) : a(avail) { ImGui::BeginDisabled(blocked()); }
     bool blocked() const {
-        return a == port::Avail::NeedsUsDisc || a == port::Avail::NeedsPalDisc || a == port::Avail::NotYet;
+        return port::availGreyed(a);
     }
     ~Gate() {
         ImGui::EndDisabled();
@@ -746,17 +746,23 @@ void gameTab() {
         };
         row("USA disc", inst.usDisc, inst.usReady);
         row("Europe disc", inst.palDisc, inst.palReady);
-        ImGui::Text("Playing: %s version", inst.running == port::GameVersion::PAL ? "European" : "USA");
-        if (inst.both()) {
+        row("Japan disc", inst.jpnDisc, inst.jpnReady);
+        ImGui::Text("Playing: %s version", inst.running == port::GameVersion::PAL   ? "European"
+                                           : inst.running == port::GameVersion::JPN ? "Japanese"
+                                                                                    : "USA");
+        if (inst.readyCount() > 1) {
             int base = int(inst.base);
             ImGui::Text("Version to play:");
-            ImGui::SameLine();
-            bool changed = ImGui::RadioButton("USA", &base, int(port::GameVersion::USA));
-            ImGui::SameLine();
-            changed |= ImGui::RadioButton("Europe", &base, int(port::GameVersion::PAL));
+            bool changed = false;
+            for (int i = 0; i < port::kGameVersions; i++) {
+                const auto v = port::GameVersion(i);
+                if (!inst.ready(v)) continue;
+                ImGui::SameLine();
+                changed |= ImGui::RadioButton(port::regionName(v), &base, i);
+            }
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
-            ImGui::SetItemTooltip("Which installed disc's game runs (both are installed). Takes a restart.");
+            ImGui::SetItemTooltip("Which installed disc's game runs. Takes a restart.");
             if (changed) {
                 inst.base = port::GameVersion(base);
                 port::saveInstall();
@@ -774,7 +780,7 @@ void gameTab() {
             port::saveSettings();
             port::relaunch(true);
         }
-        ImGui::SetItemTooltip("Restarts into the setup screen to add a USA or European disc image or replace one\n"
+        ImGui::SetItemTooltip("Restarts into the setup screen to add a USA, European or Japanese disc image or replace one\n"
                               "(unsaved game progress is lost).");
     }
     ImGui::Separator();
@@ -1664,12 +1670,16 @@ void gameplaySection() {
     sDirty |= recomp::menu::Checkbox("Always ride the Poltergust", &g.alwaysRide);
     ImGui::SetItemTooltip("Luigi glides with momentum everywhere (the European Boolossus-fight movement).");
     ImGui::SeparatorText("World");
-    sDirty |= recomp::menu::Checkbox("Mirrored Mansion", &g.mirrorWorld);
-    ImGui::SetItemTooltip("The whole game left/right mirrored, the way the European release mirrors its Hidden\n"
-                          "Mansion: the 3D picture, the Game Boy Horror map and the speakers are flipped, the\n"
-                          "stick is flipped with them (push right to go right on screen), and the HUD, text and\n"
-                          "menus are not. Works in the normal mansion and both Hidden Mansions, live.\n"
-                          "The European Hidden Mansion is always mirrored, with this on or off.");
+    {
+        // Its USA-game hooks (screen copy, stick, GBH map) are not ported to the Japanese game.
+        Gate gate(port::notOnJpn());
+        sDirty |= recomp::menu::Checkbox("Mirrored Mansion", &g.mirrorWorld);
+        ImGui::SetItemTooltip("The whole game left/right mirrored, the way the European release mirrors its Hidden\n"
+                              "Mansion: the 3D picture, the Game Boy Horror map and the speakers are flipped, the\n"
+                              "stick is flipped with them (push right to go right on screen), and the HUD, text and\n"
+                              "menus are not. Works in the normal mansion and both Hidden Mansions, live.\n"
+                              "The European Hidden Mansion is always mirrored, with this on or off.");
+    }
     if (recomp::menu::Button("Reset gameplay options")) {
         g = port::GameplaySettings{};
         sDirty = true;
@@ -1703,50 +1713,84 @@ void generalEnhancementsTab() {
                           "to the doorway that part of it is behind the camera (an original bug, e.g.\n"
                           "the upper foyer during the cutscene when Luigi first enters). On: the doorway\n"
                           "is clipped properly and the room stays visible. Off: original behaviour.");
-    ImGui::SeparatorText("Hidden Mansion");
+    ImGui::SeparatorText("Mansion version");
     {
-        // Switching mid-visit would leave PAL data/patches half applied, so only allow it outside.
-        const bool inside = recomp::hm::hiddenActive();
-        const port::Avail avail[2] = {port::hiddenMansionUs(), port::hiddenMansionPal()};
-        const bool pal = recomp::hm::variant() == recomp::hm::Variant::Pal;
-        // Either release's rules on either game (the other one's needs both discs; docs/SETUP.md).
-        const bool usGame = port::install().running == port::GameVersion::USA;
-        const char* kVariants[] = {usGame ? "USA (original)" : "USA (easier, not mirrored)",
-                                   usGame ? "European (harder, mirrored)" : "European (original)"};
-        auto usable = [&](int i) { return avail[i] == port::Avail::Yes; };
-        if (recomp::hm::labChoiceAvailable()) {
-            // Both releases' data: E. Gadd's lab asks on every visit (docs/HIDDEN_MANSION.md).
-            ImGui::TextUnformatted("Hidden Mansion version: chosen in E. Gadd's lab");
-            ImGui::SetItemTooltip("Picking the Hidden Mansion in E. Gadd's lab asks which one:\n"
-                                  "\"(USA)\" is the %s release's, \"(PAL)\" the %s release's\n"
-                                  "(harder, mirrored, darker). The save file keeps the answer for that visit.",
-                                  usGame ? "original USA" : "USA", usGame ? "European" : "original European");
-            if (inside) ImGui::TextDisabled("This visit: %s", kVariants[pal ? 1 : 0]);
+        // docs/VERSION_DIFFERENCES.md: each release's mansion (gameplay data + code differences;
+        // text, scripts and sound stay this disc's). With two or more discs E. Gadd's lab asks.
+        namespace hm = recomp::hm;
+        using V = hm::Variant;
+        const V base = hm::baseVariant();
+        const bool inside = hm::hiddenActive();
+        const V kOrder[3] = {V::Us, V::Jp, V::Pal};
+        auto label = [&](V v) {
+            static char buf[3][64];
+            const int i = int(v);
+            std::snprintf(buf[i], sizeof buf[i], "%s%s", v == V::Us ? "USA" : v == V::Jp ? "Japan" : "PAL",
+                          v == base ? " (this disc's own)" : "");
+            return buf[i];
+        };
+        auto discNote = [](V v) {
+            return v == V::Us ? "needs the USA disc" : v == V::Jp ? "needs the Japanese disc" : "needs the European disc";
+        };
+        if (hm::versionMenuAvailable()) {
+            ImGui::TextUnformatted("Mansion and Hidden Mansion version: chosen in E. Gadd's lab");
+            ImGui::SetItemTooltip("Picking \"The Mansion\" or \"The Hidden Mansion\" in E. Gadd's lab asks which release's\n"
+                                  "mansion: its ghosts, items, hearts, ranks and boss tuning (docs/VERSION_DIFFERENCES.md).\n"
+                                  "Text, cutscenes and music stay this disc's. The save keeps the answer for that visit.");
+            ImGui::TextDisabled("This visit: %s%s", hm::variantName(hm::rulesVariant()), inside ? " Hidden Mansion" : " mansion");
+            for (V v : kOrder)
+                if (!port::install().ready(v == V::Us ? port::GameVersion::USA : v == V::Jp ? port::GameVersion::JPN : port::GameVersion::PAL)) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%s: %s)", hm::variantName(v), discNote(v));
+                }
+            if (base == V::Jp) ImGui::TextDisabled("(The European Hidden Mansion is not available on the Japanese game yet.)");
         } else {
+            // One disc, or an old overlay: F1 decides (the same lists, greyed without the disc).
             ImGui::BeginDisabled(inside);
-            if (ImGui::BeginCombo("Hidden Mansion version", kVariants[pal ? 1 : 0])) {
-                for (int i = 0; i < 2; i++) {
-                    if (ImGui::Selectable(kVariants[i], (pal ? 1 : 0) == i,
-                                          usable(i) ? 0 : ImGuiSelectableFlags_Disabled)) {
-                        e.hiddenMansionPal = i == 1;
-                        recomp::hm::setVariant(e.hiddenMansionPal ? recomp::hm::Variant::Pal : recomp::hm::Variant::Us);
+            const V cur = hm::mansionVariant();
+            if (ImGui::BeginCombo("Mansion version", label(cur))) {
+                for (V v : kOrder) {
+                    const bool ok = hm::variantInstalled(v);
+                    if (ImGui::Selectable(label(v), cur == v, ok ? 0 : ImGuiSelectableFlags_Disabled)) {
+                        e.mansionVersion = v == base ? 0 : v == V::Us ? 1 : v == V::Jp ? 2 : 3;
+                        sDirty = true;
+                        pending("takes effect at the next start");
+                    }
+                    if (!ok) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", discNote(v));
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SetItemTooltip("Which release's normal mansion: gameplay data and rules (hearts, A rank, boss tuning).\n"
+                                  "Needs that release's disc. Takes effect at the next start.");
+            const V hv = hm::variant();
+            if (ImGui::BeginCombo("Hidden Mansion version", label(hv))) {
+                for (V v : kOrder) {
+                    const bool ok = hm::hiddenVariantOffered(v);
+                    if (ImGui::Selectable(label(v), hv == v, ok ? 0 : ImGuiSelectableFlags_Disabled)) {
+                        e.hiddenMansionPal = v == V::Pal;
+                        e.hiddenMansionJp = v == V::Jp ? 1 : 0;
+                        hm::setVariant(v);
                         sDirty = true;
                     }
-                    if (const char* note = port::availNote(avail[i])) {
+                    if (!ok) {
                         ImGui::SameLine();
-                        ImGui::TextDisabled("(%s)", note);
+                        ImGui::TextDisabled("(%s)", base == V::Jp && v == V::Pal && port::install().palReady
+                                                        ? "not available on the Japanese game yet"
+                                                        : discNote(v));
                     }
                 }
                 ImGui::EndCombo();
             }
             ImGui::EndDisabled();
-            ImGui::SetItemTooltip("Which release's Hidden Mansion rules the game uses: the USA one, or the European one\n"
-                                  "(harder ghosts and bosses, mirrored, darker). Both need that release's disc.%s",
+            ImGui::SetItemTooltip("Which release's Hidden Mansion rules: USA (damage x2), Japan (milder: no double damage,\n"
+                                  "hearts as normal) or the European one (harder ghosts and bosses, mirrored, darker).\n"
+                                  "Each needs that release's disc.%s",
                                   inside ? "\n\nLeave the Hidden Mansion to change it." : "");
             if (inside) pending("leave the Hidden Mansion to change");
         }
-        if (!usable(0)) pending(port::availNote(avail[0]));
-        else if (!usable(1)) pending(port::availNote(avail[1]));
     }
 }
 

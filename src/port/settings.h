@@ -93,6 +93,8 @@ struct EnhancementSettings {
     bool showFps = false;
     bool pauseOnFocusLoss = true;
     bool hiddenMansionPal = true;  // default Hidden Mansion rules for saves that have not chosen in E. Gadd's lab
+    int hiddenMansionJp = 0;       // 1: the Japanese Hidden Mansion rules as the F1 default (beats hiddenMansionPal)
+    int mansionVersion = 0;        // F1 fallback without the lab menu: 0 the base's own, 1 USA, 2 Japan, 3 PAL
     int palLanguage = 1;           // PAL game only: 1 English, 2 German, 3 French, 4 Spanish, 5 Italian (next launch)
     bool gbhClock = false;         // cut E3 GBH clock/radar screen, toggled in game with D-pad Left
     bool gbhTracker = false;       // unused GBH ghost tracker, cycled in game with D-pad Down (off/far/close)

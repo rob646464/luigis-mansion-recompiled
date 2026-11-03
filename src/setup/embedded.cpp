@@ -1,7 +1,8 @@
 // Inputs of first-run setup, embedded in the executable so they always match the runtime
-// they were built with: the decomp symbol maps (CC0 metadata), the hook list, the PAL
-// version map, and the freestanding sources compiled into the game module. The arrays are
-// generated at build time by tools/recomp/lmembed.cpp (CMakeLists.txt, LM_EMBEDDED_FILES).
+// they were built with: the symbol maps (decomp CC0 metadata; the Japanese one generated with
+// decomp-toolkit), the hook list, the PAL/Japanese version maps, and the freestanding sources
+// compiled into the game module. The arrays are generated at build time by
+// tools/recomp/lmembed.cpp (CMakeLists.txt, LM_EMBEDDED_FILES).
 #include "setup/embedded.h"
 
 namespace setup::embedded {
@@ -13,6 +14,8 @@ LM_EMBEDDED(kSymbolsUs)
 LM_EMBEDDED(kSplitsUs)
 LM_EMBEDDED(kSymbolsPal)
 LM_EMBEDDED(kVersionMapPal)
+LM_EMBEDDED(kSymbolsJp)
+LM_EMBEDDED(kVersionMapJp)
 LM_EMBEDDED(kHooks)
 LM_EMBEDDED(kCtxHeader)
 LM_EMBEDDED(kModuleAbiHeader)
@@ -26,10 +29,23 @@ std::string_view view(const char* p, unsigned long long n) { return {p, size_t(n
 }  // namespace
 
 using namespace data;
+using port::GameVersion;
 
-std::string_view symbols(bool pal) { return pal ? view(kSymbolsPal, kSymbolsPalSize) : view(kSymbolsUs, kSymbolsUsSize); }
-std::string_view splits(bool pal) { return pal ? std::string_view{} : view(kSplitsUs, kSplitsUsSize); }
-std::string_view versionMap(bool pal) { return pal ? view(kVersionMapPal, kVersionMapPalSize) : std::string_view{}; }
+std::string_view symbols(GameVersion v) {
+    switch (v) {
+    case GameVersion::PAL: return view(kSymbolsPal, kSymbolsPalSize);
+    case GameVersion::JPN: return view(kSymbolsJp, kSymbolsJpSize);
+    default: return view(kSymbolsUs, kSymbolsUsSize);
+    }
+}
+std::string_view splits(GameVersion v) { return v == GameVersion::USA ? view(kSplitsUs, kSplitsUsSize) : std::string_view{}; }
+std::string_view versionMap(GameVersion v) {
+    switch (v) {
+    case GameVersion::PAL: return view(kVersionMapPal, kVersionMapPalSize);
+    case GameVersion::JPN: return view(kVersionMapJp, kVersionMapJpSize);
+    default: return {};
+    }
+}
 std::string_view hooks() { return view(kHooks, kHooksSize); }
 std::string_view ctxHeader() { return view(kCtxHeader, kCtxHeaderSize); }
 std::string_view moduleAbiHeader() { return view(kModuleAbiHeader, kModuleAbiHeaderSize); }

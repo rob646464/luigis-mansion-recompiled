@@ -1,11 +1,14 @@
 #pragma once
+#include "port/install.h"
+
 #include <string_view>
 
 namespace setup::embedded {
 
-std::string_view symbols(bool pal);     // decomp/config/<GLME01|GLMP01_00>/symbols.txt
-std::string_view splits(bool pal);      // US only (the PAL config has no splits)
-std::string_view versionMap(bool pal);  // tools/recomp/GLMP01_map.txt (PAL only)
+// decomp/config/<GLME01|GLMP01_00|GLMJ01>/symbols.txt (the Japanese table: tools/recomp/gen_jp_symbols.py)
+std::string_view symbols(port::GameVersion v);
+std::string_view splits(port::GameVersion v);      // USA only (the other configs have no splits)
+std::string_view versionMap(port::GameVersion v);  // tools/recomp/GLMP01_map.txt / GLMJ01_map.txt (not USA)
 std::string_view hooks();               // tools/recomp/hooks.txt
 std::string_view ctxHeader();           // src/recomp/ctx.h
 std::string_view moduleAbiHeader();     // src/recomp/module_abi.h

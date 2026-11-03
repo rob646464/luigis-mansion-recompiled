@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -81,7 +82,9 @@ struct Job {
 
 // Results of the file dialogs (SDL may call back on another thread).
 std::mutex sPickM;
-std::optional<std::string> sPicked[2];
+// Slots are indexed by GameVersion: 0 USA, 1 Europe, 2 Japan.
+constexpr int kSlots = port::kGameVersions;
+std::optional<std::string> sPicked[kSlots];
 std::string sDialogError;  // the file dialog could not open (Linux: no xdg-desktop-portal/zenity)
 
 std::string readText(const std::filesystem::path& p) {
@@ -99,6 +102,16 @@ bool overlayUpToDate(const Disc& us, const Disc& pal) {
     return readText(port::hiddenMansionOverlayDir() / "overlay.key") == overlayKey(us, pal);
 }
 
+// Per-version mansions (docs/VERSION_DIFFERENCES.md): <overlay>/versions, for 2+ discs.
+constexpr const char* kVersionsFormat = "versions-overlay 1";
+std::string versionsKey(const std::vector<const Disc*>& discs) {
+    std::string text = kVersionsFormat;
+    for (const Disc* d : discs) text += std::string("\n") + port::gameId(d->version()) + " " + d->dolSha1();
+    const auto d = port::dol::sha1(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    return hex(d.data(), d.size());
+}
+std::filesystem::path versionsDir() { return port::hiddenMansionOverlayDir() / "versions"; }
+
 void validate(Slot& s, GameVersion expected) {
     s.valid = false;
     s.message.clear();
@@ -110,13 +123,16 @@ void validate(Slot& s, GameVersion expected) {
         return;
     }
     if (v != expected) {
-        s.message = std::string("This is the ") + (v == GameVersion::PAL ? "European" : "USA") +
-                    " disc; put it in the other slot.";
+        s.message = std::string("This is the ") +
+                    (v == GameVersion::PAL ? "European" : v == GameVersion::JPN ? "Japanese" : "USA") +
+                    " disc; put it in its own slot.";
         return;
     }
     s.valid = true;
     s.version = v;
-    s.message = v == GameVersion::PAL ? "Luigi's Mansion (Europe, GLMP01)" : "Luigi's Mansion (USA, GLME01)";
+    s.message = v == GameVersion::PAL   ? "Luigi's Mansion (Europe, GLMP01)"
+                : v == GameVersion::JPN ? "Luigi's Mansion (Japan, GLMJ01)"
+                                        : "Luigi's Mansion (USA, GLME01)";
     if (!discCheckEnabled()) s.check = DiscCheck{};
     else if ((s.check = cachedDiscCheck(s.path, v))) logCheck(s);
 }
@@ -124,13 +140,14 @@ void validate(Slot& s, GameVersion expected) {
 struct Plan {
     std::vector<GameVersion> modules;  // modules to (re)build
     bool overlay = false;               // PAL Hidden Mansion overlay to (re)build
-    bool empty() const { return modules.empty() && !overlay; }
+    bool versions = false;              // per-version mansions overlay to (re)build (2+ discs)
+    bool empty() const { return modules.empty() && !overlay && !versions; }
 };
 
-Plan makePlan(const Slot slots[2]) {
+Plan makePlan(const Slot slots[kSlots]) {
     Plan p;
-    std::unique_ptr<Disc> discs[2];
-    for (int i = 0; i < 2; i++) {
+    std::unique_ptr<Disc> discs[kSlots];
+    for (int i = 0; i < kSlots; i++) {
         if (!slots[i].valid) continue;
         discs[i] = std::make_unique<Disc>();
         std::string err;
@@ -141,11 +158,17 @@ Plan makePlan(const Slot slots[2]) {
         if (!moduleUpToDate(*discs[i])) p.modules.push_back(discs[i]->version());
     }
     if (discs[0] && discs[1] && !overlayUpToDate(*discs[0], *discs[1])) p.overlay = true;
+    std::vector<const Disc*> have;
+    for (const auto& d : discs)
+        if (d) have.push_back(d.get());
+    // (The Hidden Mansion overlay build replaces the whole folder, versions/ included.)
+    if (have.size() >= 2 && (p.overlay || readText(versionsDir() / "versions.key") != versionsKey(have))) p.versions = true;
     return p;
 }
 
-void startJob(Job& job, const Slot slots[2], const Plan& plan) {
-    const std::string paths[2] = {slots[0].valid ? slots[0].path : "", slots[1].valid ? slots[1].path : ""};
+void startJob(Job& job, const Slot slots[kSlots], const Plan& plan) {
+    std::array<std::string, kSlots> paths;
+    for (int i = 0; i < kSlots; i++) paths[i] = slots[i].valid ? slots[i].path : "";
     job.thread = std::thread([&job, paths, plan] {
         auto set = [&](const std::string& stage, float f) {
             std::lock_guard lk(job.m);
@@ -157,11 +180,11 @@ void startJob(Job& job, const Slot slots[2], const Plan& plan) {
             job.error = e;
             job.done = true;
         };
-        const float steps = float(plan.modules.size() + (plan.overlay ? 1 : 0));
+        const float steps = float(plan.modules.size() + (plan.overlay ? 1 : 0) + (plan.versions ? 1 : 0));
         float step = 0.0f;
         for (GameVersion v : plan.modules) {
-            const int i = v == GameVersion::PAL ? 1 : 0;
-            const char* name = v == GameVersion::PAL ? "Europe" : "USA";
+            const int i = int(v);
+            const char* name = port::regionName(v);
             set(std::string("Reading the ") + name + " disc", step / steps);
             Disc disc;
             std::string err;
@@ -180,6 +203,23 @@ void startJob(Job& job, const Slot slots[2], const Plan& plan) {
             const auto dir = port::hiddenMansionOverlayDir();
             if (!buildHiddenMansionOverlay(us, pal, dir, err)) return fail(err);
             std::ofstream(port::longPath(dir / "overlay.key"), std::ios::binary) << overlayKey(us, pal);
+            step += 1.0f;
+        }
+        if (plan.versions) {
+            set("Building the per-version mansion data", step / steps);
+            std::vector<std::unique_ptr<Disc>> open;
+            std::vector<const Disc*> list;
+            for (const std::string& path : paths) {
+                if (path.empty()) continue;
+                auto d = std::make_unique<Disc>();
+                std::string err;
+                if (!d->open(path, err)) return fail(err);
+                list.push_back(d.get());
+                open.push_back(std::move(d));
+            }
+            std::string err;
+            if (!buildVersionsOverlay(list, versionsDir(), err)) return fail(err);
+            std::ofstream(port::longPath(versionsDir() / "versions.key"), std::ios::binary) << versionsKey(list);
         }
         std::lock_guard lk(job.m);
         job.stage = "Done";
@@ -221,22 +261,37 @@ bool run(const Options& opts, LaunchInfo& launch) {
     recomp::ui::install(recomp::ui::Context::Setup);
     port::loadInstall();
     auto& inst = port::install();
-    Slot slots[2];
+    Slot slots[kSlots];
     slots[0].path = !opts.usDisc.empty() ? opts.usDisc : inst.usDisc;
     slots[1].path = !opts.palDisc.empty() ? opts.palDisc : inst.palDisc;
-    validate(slots[0], GameVersion::USA);
-    validate(slots[1], GameVersion::PAL);
+    slots[2].path = !opts.jpnDisc.empty() ? opts.jpnDisc : inst.jpnDisc;
+    for (int i = 0; i < kSlots; i++) validate(slots[i], GameVersion(i));
     GameVersion base = inst.base;
+    auto anyValid = [&] {
+        for (const Slot& s : slots)
+            if (s.valid) return true;
+        return false;
+    };
+    auto validCount = [&] {
+        int n = 0;
+        for (const Slot& s : slots) n += s.valid;
+        return n;
+    };
 
+    // The base must be an installed disc: else the first valid one (USA, Europe, Japan).
     auto chooseBase = [&] {
-        if (!slots[1].valid) base = GameVersion::USA;
-        else if (!slots[0].valid) base = GameVersion::PAL;
+        if (slots[int(base)].valid) return;
+        for (int i = 0; i < kSlots; i++)
+            if (slots[i].valid) {
+                base = GameVersion(i);
+                return;
+            }
     };
     chooseBase();
 
     // Nothing to ask: the configured discs are all readable and the base is available.
-    bool showUi = opts.forceUi || opts.autoStart || !(slots[0].valid || slots[1].valid) ||
-                  (!slots[0].path.empty() && !slots[0].valid) || (!slots[1].path.empty() && !slots[1].valid);
+    bool showUi = opts.forceUi || opts.autoStart || !anyValid();
+    for (const Slot& s : slots) showUi |= !s.path.empty() && !s.valid;
     Screen screen = Screen::Pick;
     std::unique_ptr<Job> job;
     Plan plan;
@@ -252,6 +307,7 @@ bool run(const Options& opts, LaunchInfo& launch) {
         }
         inst.usDisc = slots[0].valid ? slots[0].path : "";
         inst.palDisc = slots[1].valid ? slots[1].path : "";
+        inst.jpnDisc = slots[2].valid ? slots[2].path : "";
         inst.base = base;
         port::saveInstall();
         plan = makePlan(slots);
@@ -264,10 +320,10 @@ bool run(const Options& opts, LaunchInfo& launch) {
     // Begin once every disc image is checked: at once when there is nothing to ask (or
     // --setup-auto), unless the check finds a damaged or modified image the user has not
     // chosen to play anyway: then the setup screen shows what differs (disc_check.h).
-    bool wantBegin = !showUi || (opts.autoStart && (slots[0].valid || slots[1].valid));
+    bool wantBegin = !showUi || (opts.autoStart && anyValid());
     std::unique_ptr<CheckJob> check;
     auto pendingCheck = [&]() -> int {
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < int(std::size(slots)); i++)
             if (slots[i].valid && !slots[i].check) return i;
         return -1;
     };
@@ -290,12 +346,12 @@ bool run(const Options& opts, LaunchInfo& launch) {
         }
         {
             std::lock_guard lk(sPickM);
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < kSlots; i++) {
                 if (sPicked[i]) {
                     slots[i].path = *sPicked[i];
                     sPicked[i].reset();
-                    validate(slots[i], i ? GameVersion::PAL : GameVersion::USA);
-                    if (slots[i].valid && !slots[1 - i].valid) base = slots[i].version;
+                    validate(slots[i], GameVersion(i));
+                    if (slots[i].valid && validCount() == 1) base = slots[i].version;
                     chooseBase();
                 }
             }
@@ -373,9 +429,10 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 ImGui::PopStyleColor();
             }
             ImGui::Dummy(ImVec2(0, 8 * scale));
-            const char* labels[2] = {"USA disc (GLME01)", "Europe disc (GLMP01)"};
-            const char* notes[2] = {"", "Playable on its own; with a USA disc it also adds the European Hidden Mansion."};
-            for (int i = 0; i < 2; i++) {
+            const char* labels[kSlots] = {"USA disc (GLME01)", "Europe disc (GLMP01)", "Japan disc (GLMJ01)"};
+            const char* notes[kSlots] = {"", "Playable on its own; with a USA disc it also adds the European Hidden Mansion.",
+                                         "Playable on its own (Japanese text, its own Hidden Mansion)."};
+            for (int i = 0; i < kSlots; i++) {
                 ImGui::PushID(i);
                 ImGui::Text("%s", labels[i]);
                 ImGui::SameLine();
@@ -386,7 +443,7 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 // Linux: the file dialog needs xdg-desktop-portal (or zenity/kdialog); a typed or
                 // pasted path always works (docs/LINUX.md).
                 {
-                    static char typed[2][1024];
+                    static char typed[kSlots][1024];
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
                     const bool enter = ImGui::InputTextWithHint("##path", "or type / paste the path here",
@@ -437,16 +494,18 @@ bool run(const Options& opts, LaunchInfo& launch) {
                     ImGui::PopStyleColor();
                 }
             }
-            if (slots[0].valid && slots[1].valid) {
+            if (validCount() > 1) {
                 ImGui::Text("Version to play:");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("USA", base == GameVersion::USA)) base = GameVersion::USA;
-                ImGui::SameLine();
-                if (ImGui::RadioButton("Europe (50/60 Hz, languages)", base == GameVersion::PAL)) base = GameVersion::PAL;
-                ImGui::TextDisabled("Both versions are prepared; you can switch later in the F1 menu (Game tab).");
+                const char* names[kSlots] = {"USA", "Europe (50/60 Hz, languages)", "Japan"};
+                for (int i = 0; i < kSlots; i++) {
+                    if (!slots[i].valid) continue;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton(names[i], base == GameVersion(i))) base = GameVersion(i);
+                }
+                ImGui::TextDisabled("Every installed version is prepared; you can switch later in the F1 menu (Game tab).");
             }
             ImGui::Dummy(ImVec2(0, 8 * scale));
-            ImGui::BeginDisabled(!(slots[0].valid || slots[1].valid) || check || pendingCheck() >= 0);
+            ImGui::BeginDisabled(!anyValid() || check || pendingCheck() >= 0);
             if (ImGui::Button(started ? "Continue" : warned() ? "Play anyway" : "Install and play")) begin();
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -508,12 +567,13 @@ bool run(const Options& opts, LaunchInfo& launch) {
     // Ready: report what is installed and what to launch.
     inst.usReady = slots[0].valid;
     inst.palReady = slots[1].valid;
+    inst.jpnReady = slots[2].valid;
     inst.hmOverlayReady = slots[0].valid && slots[1].valid &&
                           std::filesystem::exists(port::longPath(port::hiddenMansionOverlayDir() / "manifest.txt")) &&
                           std::filesystem::exists(port::longPath(port::hiddenMansionOverlayDir() / "usa" / "manifest.txt"));
     inst.running = base;
     launch.version = base;
-    launch.disc = slots[base == GameVersion::PAL ? 1 : 0].path;
+    launch.disc = slots[int(base)].path;
     launch.module = modulePath(base);
     {
         const Slot& s = slots[base == GameVersion::PAL ? 1 : 0];

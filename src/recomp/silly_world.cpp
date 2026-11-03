@@ -63,7 +63,7 @@ u32 sCntView = 0, sCntGhostView = 0, sCntScaled = 0, sCntTint = 0, sCntTintCalls
 // Each wrapper scales the constant for the call only and puts it back.
 #define kCoinGravity (c.r[13] - VOFF(0x16A8, 0x16B0))
 #define kCoinRestitution (c.r[13] - VOFF(0x16A4, 0x16AC))
-#define kBillGravity (c.r[13] - VOFF(0x1964, 0x196C))
+#define kBillGravity (c.r[13] - VOFF3(0x1964, 0x196C, 0x1968))  // Japanese fn_8015066C: -0x1968
 
 float moonScale() { return cfg().moonGravity ? std::clamp(cfg().moonGravityScale, 0.05f, 1.0f) : 1.0f; }
 

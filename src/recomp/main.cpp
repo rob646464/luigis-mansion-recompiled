@@ -330,9 +330,12 @@ int main(int argc, char* argv[]) {
     {
         auto& inst = port::install();
         inst.staticBuild = true;
-        inst.running = std::strcmp(wantId, "GLMP01") == 0 ? port::GameVersion::PAL : port::GameVersion::USA;
+        inst.running = std::strcmp(wantId, "GLMP01") == 0   ? port::GameVersion::PAL
+                       : std::strcmp(wantId, "GLMJ01") == 0 ? port::GameVersion::JPN
+                                                             : port::GameVersion::USA;
         inst.usReady = inst.running == port::GameVersion::USA;
         inst.palReady = inst.running == port::GameVersion::PAL;
+        inst.jpnReady = inst.running == port::GameVersion::JPN;
         inst.hmOverlayReady = true;  // dev: orig/hidden_mansion (tools/hidden_mansion_data.py), both directions
     }
 #else
@@ -342,6 +345,7 @@ int main(int argc, char* argv[]) {
     so.autoStart = hasArg(argc, argv, "--setup-auto");
     so.usDisc = argValue(argc, argv, "--us-disc");
     so.palDisc = argValue(argc, argv, "--pal-disc");
+    so.jpnDisc = argValue(argc, argv, "--jpn-disc");
     setup::LaunchInfo launch;
     if (!setup::run(so, launch)) {
         port::recovery::onExit();
@@ -360,6 +364,7 @@ int main(int argc, char* argv[]) {
     const port::dol::Version discVersion = port::dol::load();
     const char* discId = discVersion == port::dol::Version::GLME01   ? "GLME01"
                          : discVersion == port::dol::Version::GLMP01 ? "GLMP01"
+                         : discVersion == port::dol::Version::GLMJ01 ? "GLMJ01"
                                                                      : "unknown";
     if (std::strcmp(discId, wantId) != 0) {
         std::fprintf(stderr, "The game was recompiled from Luigi's Mansion %s; the disc is %s.\n", wantId, discId);

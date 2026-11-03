@@ -5,40 +5,46 @@
 #   <symbol> us pal   also the PAL build, once the hook has been checked against PAL code
 #   <symbol> pal      PAL build only
 #   palfn_<addr>      a function only the PAL build has (by its PAL address), tagged `pal`
-# After tagging a hook `pal`, run tools/recomp/gen_version_map.py (maps it to its PAL
-# address). A hook tagged `pal` runs on the European game too: its handler must use VA()/VOFF()
-# for addresses and offsets (src/recomp/version.h). See docs/SETUP.md.
+#   ... jp            also the Japanese build (GLMJ01), once checked against its code
+#                     (`tools/pal_diff.py --jp show <fn>`); jpfn_<addr>: Japanese-only function
+# After tagging a hook `pal` or `jp`, run tools/recomp/gen_version_map.py --target all (maps it
+# to its PAL / Japanese address). A hook tagged `pal`/`jp` runs on that game too: its handler
+# must use VA()/VOFF() for addresses and offsets (src/recomp/version.h). See docs/SETUP.md.
+# Not tagged `jp` (docs/SETUP.md "The Japanese game"): the HVQM movie hooks and fn_8005582C
+# (not in the Japanese game), the European Hidden Mansion tuning hooks the Japanese game changed
+# (fn_800B41E0, fn_8009FD54), and every USA-only line. (The heart hooks fn_800E70BC/fn_800E7698 are
+# tagged: their handlers only correct the result to another release's threshold.)
 
 # JAudio's DSP driver: the audio DSP is not emulated. Its boot handshake is skipped
 # and its command mailbox / halt release drive our microcode stand-in
 # (src/recomp/hle_audio.cpp, src/recomp/audio_dsp.cpp).
-DspBoot__Fv us pal
-DSPSendCommands__FPUlUl us pal
-DSPReleaseHalt__Fv us pal
-DSPWaitFinish__Fv us pal
-DiplSec__FUl us pal
+DspBoot__Fv us pal jp
+DSPSendCommands__FPUlUl us pal jp
+DSPReleaseHalt__Fv us pal jp
+DSPWaitFinish__Fv us pal jp
+DiplSec__FUl us pal jp
 # Output side data per AI block (discrete surround) and the game's sound mode, kept in step
 # with F1 > Sound > Output (src/recomp/hle_audio.cpp, docs/AUDIO.md "Surround").
-Jac_imixcopy__FPsPsPsl us pal
-fn_8018A70C us pal
+Jac_imixcopy__FPsPsPsl us pal jp
+fn_8018A70C us pal jp
 fn_8005582C us pal
-fn_800558C8 us pal
+fn_800558C8 us pal jp
 # Music / sound-effect split of the volume sliders: the physical channel table and each note's instrument (docs/AUDIO.md "Volume sliders").
-AllocDSPchannel__FUlUl us pal
-Play_1shot__FP4jcs_8SOUNDID_Ul us pal
-Play_1shot_Perc__FP4jcs_8SOUNDID_Ul us pal
+AllocDSPchannel__FUlUl us pal jp
+Play_1shot__FP4jcs_8SOUNDID_Ul us pal jp
+Play_1shot_Perc__FP4jcs_8SOUNDID_Ul us pal jp
 # JAudio's DSP overload check no longer stops voices (host timing artifact; docs/AUDIO.md "The DSP overload check").
-BreakLowerActiveDSPchannel__FUc us pal
+BreakLowerActiveDSPchannel__FUc us pal jp
 # JAI SE frame update: LM_JAI_CHECK=1 reports an SE list that loops (diagnostic, src/recomp/hle_audio.cpp).
 fn_80191A1C
 # JAI SE starts run with interrupts off: a start from the scene-loading thread interrupted
 # halfway corrupted the SE lists (game hang after the opening skip; src/recomp/hle_audio.cpp).
-fn_8019754C us pal
-fn_80197810 us pal
-fn_80197B30 us pal
+fn_8019754C us pal jp
+fn_80197810 us pal jp
+fn_80197B30 us pal jp
 # AFC stream scheduler, interrupts off for the same reason: the main and the sound thread both run
 # it, a start interrupted halfway started the stream twice (crackle, issue #25; hle_audio.cpp).
-fn_80193B20 us pal
+fn_80193B20 us pal jp
 # HVQM4 movie (options menu "View a Pikmin(TM) Movie"): the audio stream is not reported
 # ready before the scene's first picture, or the player deadlocks waiting for its first
 # picture buffer (src/recomp/hvqm.cpp).
@@ -48,56 +54,56 @@ Jac_HVQM_ForceStop us pal
 StreamSyncCheckReady us pal
 
 # Camera culling planes: widened for the Hor+ widescreen projection (src/recomp/widescreen.cpp).
-fn_80008D58 us pal
+fn_80008D58 us pal jp
 # Widescreen scenes (src/recomp/widescreen.cpp): the iris wipes' side boxes and the area-clear
 # screens' black mask (Portrificationizer result screens) are extended to the display's edges.
-fn_80050524 us pal
-draw__9J2DScreenFiiPC14J2DGrafContext us pal
-drawTexCoord__10J2DPictureFiiiiffffffffPA3_A4_f us pal
+fn_80050524 us pal jp
+draw__9J2DScreenFiiPC14J2DGrafContext us pal jp
+drawTexCoord__10J2DPictureFiiiiffffffffPA3_A4_f us pal jp
 # S3DModel opaque draw: Luigi keeps blinking on the result screens (widescreen.cpp).
-fn_80059C54 us pal
-J2DFillBox__FiiiiQ28JUtility6TColor us pal
+fn_80059C54 us pal jp
+J2DFillBox__FiiiiQ28JUtility6TColor us pal jp
 # Gallery screen setup: test aid LM_GALLERY_PARAM (src/recomp/dev_tools.cpp).
 fn_8018712C
 
 # Room portal rectangle: re-done with near-plane clipping when the doorway straddles the
 # camera, so the room behind it doesn't vanish (src/recomp/portal_fix.cpp, docs/RENDERING.md).
-fn_8001333C us pal
+fn_8001333C us pal jp
 
 # PAL Hidden Mansion tuning (src/recomp/hidden_mansion_hooks.cpp, docs/HIDDEN_MANSION.md):
 # each wraps the original and only changes behaviour while the PAL rules are active.
-fn_800E70BC us pal
-fn_800E7698 us pal
+fn_800E70BC us pal jp
+fn_800E7698 us pal jp
 fn_8009FD54 us pal
-fn_8009FCA8 us pal
-fn_8006D1B8 us pal
-fn_800168EC us pal
+fn_8009FCA8 us pal jp
+fn_8006D1B8 us pal jp
+fn_800168EC us pal jp
 fn_800B41E0 us pal
 # E. Gadd's lab menu with both Hidden Mansions: keep a wider choice box on screen.
-fn_80043104 us pal
+fn_80043104 us pal jp
 # PAL Hidden Mansion boss mechanics (same file): Boolossus movement mode, Chauncey balls and
 # rocking horses, Bowser bomb volleys.
-fn_800B783C us pal
-fn_8009F1DC us pal
-fn_800A184C us pal
+fn_800B783C us pal jp
+fn_8009F1DC us pal jp
+fn_800A184C us pal jp
 fn_800A47BC
-fn_800A441C us pal
+fn_800A441C us pal jp
 fn_800A5BA0
 fn_800A926C
 # PAL Hidden Mansion mirror (same file): screen-copy quad, stick X, HUD projection, wipe.
-fn_8005F8B8 us pal
-fn_8007F9B8 us pal
-fn_800807EC us pal
-fn_800809CC us pal
-fn_80041214 us pal
+fn_8005F8B8 us pal jp
+fn_8007F9B8 us pal jp
+fn_800807EC us pal jp
+fn_800809CC us pal jp
+fn_80041214 us pal jp
 fn_80009148
-fn_80055C54 us pal
+fn_80055C54 us pal jp
 set__7JUTRectFiiii
 # Mirror outside the screen copy, also for "Mirror world" (src/recomp/mirror_world.cpp,
 # docs/ENHANCEMENTS.md): Game Boy Horror map draws (both games), the USA game's map focus,
 # camera reset and Luigi's map effect (the European code's equivalent).
-fn_80029DD4 us pal
-fn_8002A01C us pal
+fn_80029DD4 us pal jp
+fn_8002A01C us pal jp
 fn_8001D894
 fn_8002A5A0
 fn_8002A74C
@@ -109,79 +115,79 @@ patch 60 8002B034 48139F25
 # Unused content (src/recomp/unused_content.cpp, docs/UNUSED_CONTENT.md): Game Boy Horror
 # HUD update (live camera screen mode) and the actor draw pass
 # (early ghost shading).
-fn_8003CFC0 us pal
-fn_80060E70 us pal
+fn_8003CFC0 us pal jp
+fn_80060E70 us pal jp
 # Gameplay / difficulty options (src/recomp/gameplay_hooks.cpp, docs/GAMEPLAY_OPTIONS.md):
 # damage, Luigi health, ghost HP, vacuum strength, recovery hearts.
-fn_800B9488 us pal
-fn_800AD5AC us pal
-fn_800AE1A4 us pal
-fn_800C0F08 us pal
-fn_800C08DC us pal
-fn_80081BCC us pal
-getValue__Q24Koga8ToolDataCFiPCcPPCc us pal
-fn_800D1458 us pal
-fn_800E8904 us pal
-fn_800E58D4__Q24Koga9EnManagerFUlPQ24Koga8ToolDatal us pal
+fn_800B9488 us pal jp
+fn_800AD5AC us pal jp
+fn_800AE1A4 us pal jp
+fn_800C0F08 us pal jp
+fn_800C08DC us pal jp
+fn_80081BCC us pal jp
+getValue__Q24Koga8ToolDataCFiPCcPPCc us pal jp
+fn_800D1458 us pal jp
+fn_800E8904 us pal jp
+fn_800E58D4__Q24Koga9EnManagerFUlPQ24Koga8ToolDatal us pal jp
 # In-game HUD elements, anchored to the screen edges as units in widescreen
 # (src/recomp/widescreen.cpp): Game Boy Horror, its screen noise, the frame loop's view
 # setup (GBH live 3D view, the scan view's small main view), event portraits (E. Gadd's call
 # on the GBH screen), room name, health meter.
-fn_8003D634 us pal
-fn_8003BE9C us pal
-fn_800115F8 us pal
-fn_80114E18 us pal
+fn_8003D634 us pal jp
+fn_8003BE9C us pal jp
+fn_800115F8 us pal jp
+fn_80114E18 us pal jp
 # ...except the event scene's render-to-texture pass inside it (door knob reflection): its
 # viewport stays where the game copies it from.
-fn_801142C4 us pal
-fn_80045BDC us pal
-fn_800417F8 us pal
+fn_801142C4 us pal jp
+fn_80045BDC us pal jp
+fn_800417F8 us pal jp
 # Game Boy Horror map screen (its frame-loop scene): the map's viewport follows the centered
 # bezel in widescreen (src/recomp/widescreen.cpp).
-fn_8000C598 us pal
+fn_8000C598 us pal jp
 # Message windows (all dialogue): shown at the game frame while interpolating (src/recomp/tags.cpp).
-fn_80044138 us pal
+fn_80044138 us pal jp
 # Sky dome draw (boss arenas): shown at the game frame while interpolating (src/recomp/tags.cpp).
-fn_8002FA34 us pal
+fn_8002FA34 us pal jp
 # Early ghost lighting (cheat-equivalent, src/recomp/unused_content.cpp)
-fn_8005A5D4 us pal
+fn_8005A5D4 us pal jp
 
 # Loaded files' Yay0 decompressor: a null destination (failed buffer allocation) is refused instead
 # of decompressing over low memory (src/recomp/hle_dvd.cpp).
-fn_800071D0__18LMDvdFileInfoBlockFP18LMDvdFileInfoBlock us pal
+fn_800071D0__18LMDvdFileInfoBlockFP18LMDvdFileInfoBlock us pal jp
 
 # Unused assets (src/recomp/unused_assets.cpp, docs/UNUSED_CONTENT.md): portrait table readers,
 # map setup (door table), sky load callback, archive resource lookup/size (sky + GBH-map Luigi).
-fn_80121E14 us pal
-fn_80124890 us pal
-fn_800122BC us pal
-fn_8002F4DC us pal
-getResource__10JKRArchiveFPCc us pal
-getResSize__10JKRArchiveCFPCv us pal
+fn_80121E14 us pal jp
+fn_80124890 us pal jp
+fn_800122BC us pal jp
+fn_8002F4DC us pal jp
+getResource__10JKRArchiveFPCc us pal jp
+getResSize__10JKRArchiveCFPCv us pal jp
 
 # Unused air/water Poltergust nozzles (src/recomp/nozzles.cpp): Luigi's Poltergust mode
 # selector, which re-types the nozzle actor.
-fn_800B36B8 us pal
+fn_800B36B8 us pal jp
 
 # Unused model swaps (src/recomp/unused_models.cpp, early_luigi.cpp): model archive setup
 # (registry entry); unused models / the early Luigi .mdl are swapped in after it.
-fn_80061C94 us pal
+fn_80061C94 us pal jp
 # F1 > Enhancements > Silly (src/recomp/silly.cpp): Luigi's joints (head/body size, wobble, paper)
 # are changed before the S3D skinning matrices are built from them.
-fn_80058850 us pal
+fn_80058850 us pal jp
 # Play as Mario (src/recomp/play_as_mario.cpp): S3DModel vertex morphs (Luigi's face shapes)
 # are skipped for the Mario model.
-fn_8005C760 us pal
+fn_8005C760 us pal jp
 
 # Developer tools (src/recomp/dev_tools.cpp, docs/UNUSED_CONTENT.md): map warps through the
 # scene manager (+ LM_START_MAP), the game's JUTReport queue (debug text overlay), and the
 # end-of-frame copy where debug switches are applied and the model viewer draws.
-fn_8000C188 us pal
-fn_8000B4A0 us pal
-fn_801D7114 us pal
-LMChangeFrameBuffer__Fv us pal
+fn_8000C188 us pal jp
+fn_8000B4A0 us pal jp
+fn_801D7114 us pal jp
+LMChangeFrameBuffer__Fv us pal jp
 # Warp arrivals hold back the destination's entry events (event trigger condition check).
-fn_8002B6D4 us pal
+fn_8002B6D4 us pal jp
 # USA Hidden Mansion rules on the European game (src/recomp/hidden_mansion_hooks.cpp,
 # docs/SETUP.md): European functions whose hidden-mansion code is PAL-only run with the flag
 # hidden; those where the USA game reads it too see the real flag; Luigi's state update
@@ -195,7 +201,7 @@ fn_800A09D0 pal
 fn_800A1BCC pal
 fn_8018865C pal
 fn_80189054 pal
-fn_800B9680 pal
+fn_800B9680 us pal
 fn_8003DF88 pal
 fn_800DBE8C pal
 fn_800B84E4 pal
@@ -203,8 +209,8 @@ fn_800B84E4 pal
 # frames (src/recomp/hle_vi.cpp).
 palfn_80007844 pal
 # Action Replay debug modes as toggles (dev_tools.cpp): Luigi draw-pass callback, HUD test sprites.
-fn_800B172C us pal
-fn_8003BEEC us pal
+fn_800B172C us pal jp
+fn_8003BEEC us pal jp
 fn_8003EBB0
 # Leftover room visits (room_swap.cpp): Luigi's start position for the visited room.
 findLuigiAppearIndex__Q24Koga9EnManagerFPQ24Koga8ToolDataUl
@@ -214,63 +220,75 @@ getValue__Q24Koga8ToolDataCFiPCcPf
 # The replacement runs while switch <id> is on (setPatch, src/recomp/runtime.h). The address is
 # the running release's own: a patch for both releases is two lines, the USA one (untagged or
 # `us`) and the European one tagged `pal` (same instruction in the matched function, checked
-# with tools/pal_diff.py show).
+# with tools/pal_diff.py show); the Japanese lines (`jp`) are the same instruction in the matched
+# Japanese function, whose original word equals the USA one (all in unchanged functions).
 # Unused Game Boy Horror ghost tracker (TCRF): fn_8004463C loads r0 = 0 at 0x8004472C, which
 # keeps the tracking code from running; 1 = far mode (swaying, smooth), 2 = close mode (accurate).
 # European fn_80045B30 is identical: 0x80045C20.
 patch 1 8004472C 38000001
+patch 1 8004414C 38000001 jp
 patch 2 8004472C 38000002
+patch 2 8004414C 38000002 jp
 patch 1 80045C20 38000001 pal
 patch 2 80045C20 38000002 pal
 # Cut E3 Game Boy Horror clock + radar screen (TCRF): GBH screen mode 1 draws it once the mode
 # switch in fn_8003CFC0 branches to it (0x8003D544 b +0xBC -> b +0xD8). European fn_8003E43C:
 # 0x8003E9C0, same branch.
 patch 3 8003D544 480000D8
+patch 3 8003D10C 480000D8 jp
 patch 3 8003E9C0 480000D8 pal
 # Lightning test aid (lightning_test.cpp, LM_LIGHTNING): room Thunder field (the room update
 # fn_800168EC is hooked once, in hidden_mansion_hooks.cpp, and calls the aid).
-fn_8002D7C8 us pal
+fn_8002D7C8 us pal jp
 # Shadow-map enhancements (shadows.cpp): light camera setup of the shadow pass.
-fn_8005D984 us pal
-fn_800293A8 us pal
-fn_80029050 us pal
+fn_8005D984 us pal jp
+fn_800293A8 us pal jp
+fn_80029050 us pal jp
 # Unused 2-player mode (src/recomp/coop.cpp, docs/UNUSED_CONTENT.md): the known Action Replay
 # code's instruction patches, all switched on with the mode (the flag and the port-2 pad of the
 # code's boot cave are host code at map setup). European lines: the same instructions in the
 # matched functions (tools/pal_diff.py show; sGamePad is r13+0x118 on both releases).
 # 0x800726D8 player creation: players after the first get sGamePad[1] (r13+0x11C) instead of none.
 patch 40 800726D8 800D011C
+patch 40 80071450 800D011C jp
 patch 40 80075560 800D011C pal
 # Doors (fn_80079E20): skip the room-blocked check, and treat every locked door as unlockable.
 patch 41 80079EB4 60000000
+patch 41 80078C08 60000000 jp
 patch 42 80079E6C 48000010
+patch 42 80078BC0 48000010 jp
 patch 41 8007CD34 60000000 pal
 patch 42 8007CCEC 48000010 pal
 # fn_800B9430 (Luigi +0x792 event-bit test, e.g. <WEAPON>): always true, so player 2 has the
 # Poltergust and Game Boy Horror.
 patch 43 800B943C 3003FFFE
+patch 43 800B7BB0 3003FFFE jp
 patch 43 800BC854 3003FFFE pal
 # fn_8000BB98 (draw one view): view 1 draws the whole scene like view 0 (ghost layer, effects).
 patch 44 8000BBC4 60000000
+patch 44 8000BA90 60000000 jp
 patch 45 8000BC24 60000000
+patch 45 8000BAF0 60000000 jp
 patch 44 8000CA40 60000000 pal
 patch 45 8000CAA0 60000000 pal
 # fn_8003E7B0 (HUD after each view): the HUD is not skipped in 2-player mode.
 patch 46 8003E7D8 60000000
+patch 46 8003E3A0 60000000 jp
 patch 46 8003FE58 60000000 pal
 # fn_80079440 (door touch): a door with no free side still opens (fn_80079E20).
 patch 47 80079574 60000000
+patch 47 800782C8 60000000 jp
 patch 47 8007C3F4 60000000 pal
 # 2-player mode, per-frame work (coop_fixes.cpp): the game-scene view/camera update.
-fn_800112F8 us pal
+fn_800112F8 us pal jp
 # Flashlight update (per Luigi): which player's light a ghost message comes from.
-fn_800850B4 us pal
+fn_800850B4 us pal jp
 # HUD overlay pass after each view (2-player HUD after both views, player 2's health meter).
-fn_8003E7B0 us pal
+fn_8003E7B0 us pal jp
 # 2-player view layout (co-op improvements): full-screen shared view, side-by-side split
 # (fn_80011150 sets the view cameras' viewports, fn_80020654 updates a camera from them).
-fn_80011150 us pal
-fn_80020654 us pal
+fn_80011150 us pal jp
+fn_80020654 us pal jp
 # Objects sucked toward the nozzle (hearts and other items, Boolossus' frozen Boos) test player 1's
 # suction only (fn_80143174 -> fn_80145578 -> fn_80144664: fn_800AD39C(0), room visible in view 0):
 # with the co-op improvements the test runs as player 2 (fn_800AC164: player 0 -> 1,
@@ -286,16 +304,16 @@ fn_8001CEAC
 # Enhanced lighting (src/recomp/enhanced_lighting.cpp, docs/RENDERING.md): the main 3D view of the
 # game scene is bracketed to send the frame's extra lights and the scene-end marker (bloom,
 # volumetric beam, ambient occlusion are applied there, before the HUD).
-fn_8000BB98 us pal
+fn_8000BB98 us pal jp
 # Enhanced "Shadow map size": the shadow map's Z16 copy ends the offscreen caster pass (shadows.cpp).
-fn_8005D8CC us pal
-fn_8005DCA0 us pal
-fn_8005DD50 us pal
+fn_8005D8CC us pal jp
+fn_8005DCA0 us pal jp
+fn_8005DD50 us pal jp
 # World lights (src/recomp/world_lights.cpp, docs/RENDERING.md "Enhanced lighting > World lights"):
 # particle resource names and emitter creation, to light candles, fires, sprays and sparkles.
-getResource__10JKRArchiveFUlPCc us pal
-fn_8015FE9C us pal
-fn_80029250 us pal
+getResource__10JKRArchiveFUlPCc us pal jp
+fn_8015FE9C us pal jp
+fn_80029250 us pal jp
 
 # Second unused-content batch (src/recomp/unused2.cpp and friends, docs/UNUSED_CONTENT.md
 # "Second batch"). Bordered view: fn_80010F20 (game-scene viewport setup) only reaches its third
@@ -303,70 +321,84 @@ fn_80029250 us pal
 # the `beq` at 0x80010FD4 (41820064) into a branch to that case; European fn_80011B00 is the same
 # (0x80011BB4).
 patch 50 80010FD4 480000D8
+patch 50 80010C94 480000D8 jp
 patch 50 80011BB4 480000D8 pal
 # With the bordered view and the Game Boy Horror camera both on, views 1/2 get the rectangles
 # the two-view case would set (unused2.cpp).
-fn_80010F20 us pal
+fn_80010F20 us pal jp
 # Jukebox: Mario.com (an unused sequence) is moved to the bank it was written for where JAudio
 # takes sequence data (src/recomp/jukebox.cpp).
-Jaq_SetSeqData_Limit us pal
+Jaq_SetSeqData_Limit us pal jp
 # Luigi's message handler (poison mushroom, startle -> crawling fear) and the element-meter HUD
 # (overheat meter): luigi_states.cpp.
-fn_800AEEA8 us pal
-fn_80045F58 us pal
-fn_80046120 us pal
+fn_800AEEA8 us pal jp
+fn_80045F58 us pal jp
+fn_80046120 us pal jp
 # fn_800B7090: the cut panic mode (fear mode 4) starts effect 0xE every frame and floods the view
 # with heart particles; with the crawling-fear option the mode test at 0x800B742C (2C000004
 # cmpwi r0, 4) never matches, so the effect is not started (luigi_states.cpp).
 patch 51 800B742C 2C00007F
+patch 51 800B5BA8 2C00007F jp
 patch 51 800BA7B8 2C00007F pal
 # Ending scene draw (gallery.cpp): the unused Luigi pictures by rank.
-fn_8000E050 us pal
+fn_8000E050 us pal jp
 
 # Frame interpolation identity tags (src/recomp/tags.cpp, docs/INTERPOLATION.md "Tagged
 # interpolation"): the game's draw entry points open a tag scope around what they draw.
-fn_8006033C us pal
-fn_80059C54 us pal
-fn_80059F6C us pal
-fn_8005A280 us pal
-fn_800597C0 us pal
-fn_800598E0 us pal
-fn_800599E8 us pal
-fn_80058A60 us pal
-fn_800595B8 us pal
-fn_80057F90 us pal
-fn_800581E8 us pal
-fn_8001F098 us pal
-fn_8001F138 us pal
-fn_80015CF4 us pal
-fn_80015844 us pal
-fn_80127A74 us pal
-fn_80127AA8 us pal
-draw__14J3DShapePacketFv us pal
-draw__12J3DMatPacketFv us pal
-drawInit__6J3DSysFv us pal
-loadMtxIndx_PNGP__11J3DShapeMtxCFiUs us pal
-loadMtxIndx_PCPU__11J3DShapeMtxCFiUs us pal
-loadMtxIndx_NCPU__11J3DShapeMtxCFiUs us pal
-loadMtxIndx_PNCPU__11J3DShapeMtxCFiUs us pal
-fn_80091A70 us pal
-fn_80027F08 us pal
-fn_80025E00 us pal
-fn_8005E110 us pal
-fn_80118E44 us pal
-fn_80120C30 us pal
-fn_800F3120 us pal
-fn_80015BDC us pal
-draw__7J2DPaneFiiPC14J2DGrafContextb us pal
-free__10JKRExpHeapFPv us pal
+fn_8006033C us pal jp
+fn_80059C54 us pal jp
+fn_80059F6C us pal jp
+fn_8005A280 us pal jp
+fn_800597C0 us pal jp
+fn_800598E0 us pal jp
+fn_800599E8 us pal jp
+fn_80058A60 us pal jp
+fn_800595B8 us pal jp
+fn_80057F90 us pal jp
+fn_800581E8 us pal jp
+fn_8001F098 us pal jp
+fn_8001F138 us pal jp
+fn_80015CF4 us pal jp
+fn_80015844 us pal jp
+fn_80127A74 us pal jp
+fn_80127AA8 us pal jp
+draw__14J3DShapePacketFv us pal jp
+draw__12J3DMatPacketFv us pal jp
+drawInit__6J3DSysFv us pal jp
+loadMtxIndx_PNGP__11J3DShapeMtxCFiUs us pal jp
+loadMtxIndx_PCPU__11J3DShapeMtxCFiUs us pal jp
+loadMtxIndx_NCPU__11J3DShapeMtxCFiUs us pal jp
+loadMtxIndx_PNCPU__11J3DShapeMtxCFiUs us pal jp
+fn_80091A70 us pal jp
+fn_80027F08 us pal jp
+fn_80025E00 us pal jp
+fn_8005E110 us pal jp
+fn_80118E44 us pal jp
+fn_80120C30 us pal jp
+fn_800F3120 us pal jp
+fn_80015BDC us pal jp
+draw__7J2DPaneFiiPC14J2DGrafContextb us pal jp
+free__10JKRExpHeapFPv us pal jp
 # Game heap allocations: failures logged loudly, LM_HEAP_LOG=1 logs all (src/recomp/tags.cpp).
-alloc__10JKRExpHeapFUli us pal
+alloc__10JKRExpHeapFUli us pal jp
 # Silly options, world (src/recomp/silly_world.cpp, docs/ENHANCEMENTS.md "Silly options: world"):
 # moon gravity (coin / bill grain updates, treasure item fall state), confetti (coin / bill
 # bursts), ghost size (S3D calcView: the view matrix the joints are put into eye space with).
-fn_80157030 us pal
-fn_8015066C us pal
-fn_800CD1F4 us pal
-fn_801589A8 us pal
-fn_80151CC8 us pal
-fn_80059710 us pal
+fn_80157030 us pal jp
+fn_8015066C us pal jp
+fn_800CD1F4 us pal jp
+fn_801589A8 us pal jp
+fn_80151CC8 us pal jp
+fn_80059710 us pal jp
+
+# Per-version mansions (hidden_mansion.cpp syncConstants, docs/VERSION_DIFFERENCES.md): Chauncey's
+# approach state fn_8009FD54 stops at the distance its two later loads give (USA 15f, Japan 10f,
+# PAL normal 20f): those loads re-pointed at the 10f / 20f / 15f literal (r2-relative).
+patch 61 8009FFC8 C002999C
+patch 61 8009FFF4 C002999C
+patch 62 8009FFC8 C00299B4
+patch 62 8009FFF4 C00299B4
+patch 62 8009EB40 C002999C jp
+patch 62 8009EB6C C002999C jp
+patch 63 8009EB40 C00299A8 jp
+patch 63 8009EB6C C00299A8 jp

@@ -14,7 +14,7 @@
 
 namespace port::dol {
 
-enum class Version { Unknown, GLME01, GLMP01 };
+enum class Version { Unknown, GLME01, GLMP01, GLMJ01 };
 
 // Identifies a main.dol image by SHA-1 (Unknown if it is not a supported retail build).
 Version identify(const uint8_t* dol, size_t size);

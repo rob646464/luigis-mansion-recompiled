@@ -27,13 +27,40 @@ namespace recomp::hm {
 // an overlay built before it) the variant is F1 > Enhancements > Hidden Mansion version
 // (settings hiddenMansionPal). --hidden-mansion-variant pal|us (alias --hidden-mansion; env
 // LM_HIDDEN_MANSION_VARIANT) overrides both, for testing.
-enum class Variant { Us = 0, Pal = 1 };
+enum class Variant { Us = 0, Pal = 1, Jp = 2 };
 Variant variant();
 void setVariant(Variant v);  // the F1 setting (used without the lab menu)
+const char* variantName(Variant v);  // "USA" / "PAL" / "Japan"
+Variant baseVariant();               // the running game's own release
 
 constexpr unsigned kLabFlagPal = 8;
 bool labChoiceAvailable();           // both variants installed and the overlay has the lab menu
 std::optional<Variant> labChoice();  // with the lab menu: the variant flag 8 records
+
+// ---- Per-version mansions (docs/VERSION_DIFFERENCES.md "Lab menu design") ----------------
+// With two or more discs, E. Gadd's lab asks which release's mansion "The Mansion" and "The
+// Hidden Mansion" take you to (only installed releases, the base's own first). The answer is
+// two persistent game flags set by the lab script: (60, 76) = (0,0) the base's own, (1,0) USA,
+// (0,1) Japan, (1,1) PAL; flag 8 keeps meaning "the PAL Hidden Mansion" (its scripts read it).
+// Rules of a release = its gameplay data (map archives from setup's versions overlay) + the code
+// differences in rules() below; text, scripts and sound stay the base disc's.
+constexpr unsigned kVersionFlagA = 60, kVersionFlagB = 76;
+bool versionMenuAvailable();      // the versions overlay with the lab menu is installed
+std::optional<Variant> versionField();  // the lab's answer, nullopt = the base's own (0,0)
+Variant mansionVariant();         // whose normal mansion applies (outside the Hidden Mansion)
+Variant rulesVariant();           // whose rules apply now (hidden: variant(), else mansionVariant())
+bool variantInstalled(Variant v); // that release's disc is installed (its data was built)
+// Hidden Mansion variants offered on this base (the lab menu's list; PAL on the Japanese base: not yet).
+bool hiddenVariantOffered(Variant v);
+// The gameplay-code differences of one release (docs/VERSION_DIFFERENCES.md sections 1-3).
+struct Rules {
+    int heartThreshold;   // small heart heals 20 from this treasure counter (status +0x6C8)
+    bool doubleDamage;    // Luigi's damage x2 (hidden only)
+    u32 rankA;            // money for the A rank
+    float chaunceyDist;   // Chauncey stops approaching at this distance
+    bool bowserBomb90;    // Bowser's thrown bombs: +0x1D4 = 90
+};
+Rules rules(Variant v, bool hidden);
 
 // LM_HM_OVERLAY points at the overlay built by tools/hidden_mansion_data.py (default:
 // orig/hidden_mansion, searched upwards from the working directory). LM_HM_FORCE=1 keeps the
@@ -60,6 +87,9 @@ bool palRulesActive();  // the PAL rules apply (either game): variant() == Pal &
 // plain callOriginal. Flag readers and their reachability: docs/SETUP.md.
 void callWithoutFlag(Ctx& c, const char* name);
 void callWithFlag(Ctx& c, const char* name);
+// The original with the flag reading `shown` for the duration (another release's rules where
+// the running game reads the flag for one difference, e.g. no damage x2 for the Japanese rules).
+void callWithFlagAs(Ctx& c, const char* name, bool shown);
 
 // ---- Disc overlay ---------------------------------------------------------------------
 // Host file that should be served instead of a guest disc path, if any. Map archives are
