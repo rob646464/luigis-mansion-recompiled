@@ -3,9 +3,8 @@
 What separates the base mansion (and the Hidden Mansion) of the three retail releases, where
 each difference lives, and what it takes to offer every version's rules on any base, as
 E. Gadd's lab already does for the two Hidden Mansions (docs/HIDDEN_MANSION.md). This is
-research for the planned lab menu "The Mansion (USA) / (Japan) / (PAL)" and "The Hidden
-Mansion (USA) / (Japan) / (PAL)"; no game code implements it yet (the Japanese base is being
-added on branch `japan-support`).
+the basis of the lab menu "The Mansion (USA) / (Japan) / (PAL)" and "The Hidden Mansion
+(USA) / (Japan) / (PAL)", implemented on branch `japan-support` (section 6, *Implementation*).
 
 Releases: **USA** GLME01 rev 0, **Japan** GLMJ01 rev 0 (the first build), **PAL** GLMP01
 rev 0. "US" names and addresses are the USA symbols (`decomp/config/GLME01`); a Japanese or
@@ -315,3 +314,64 @@ Where will you go, Luigi?          ->  The Mansion
 4. Identify the "unidentified" rows of 1.1 by A/B play on the Japanese and USA discs; add
    only what turns out to be a rule, not a bug.
 5. Optional: Japanese soundtrack option, script pacing transform.
+
+## 6. Implementation (branch japan-support)
+
+**Data.** With two or more discs, setup builds `<data>/hidden_mansion/versions/`
+(`src/setup/hm_overlay.cpp` `buildVersionsOverlay`, key `versions.key` over every disc's DOL
+hash, rebuilt with the Hidden Mansion overlay): `<ID>/Map/map2.szp`, `Map/map4.szp`,
+`Iwamoto/map2/room_70.arc`, `room_08.arc`, `model/kopabody.szp` of each installed disc, and
+`lab/<base ID>/Event/event08.szp` for each possible base. The PAL `game.szp` (one item table) is
+not served yet.
+
+**Lab script** (per base, from that base's own archive and every language table in it): the
+`"back"` (The Mansion) and `"urayasiki"` (The Hidden Mansion) cases become a follow-up
+`<CHOICE>` "The Mansion (USA) / (Japan) / (PAL)" (the base's own first, then USA, Japan, PAL;
+Japanese tables 「（ＵＳＡ）」「（日本）」「（ＰＡＬ）」), each branch writing `<FLAGON|OFF>(60)`/`(76)` (and
+`(8)` for the Hidden Mansion: on only for PAL) right before `<OMOTELUIGI>` / `<URALUIGI>`;
+flags 8, 60, 76 are cleared at the top of the script (entering the lab). With one disc nothing
+is served. The PAL Hidden Mansion is not offered on the Japanese base. The versions menu
+supersedes the two-variant lab menu (docs/HIDDEN_MANSION.md) whenever it is installed.
+
+**Flags 60/76.** No event script of any release uses them (all three discs' `Event/*.szp`
+scanned), and `LM_WATCH` on their bytes over the opening -> lab -> mansion routes showed only
+the new-game clear and the lab script's own writes. A full playthrough with the watch has not
+been run.
+
+**Runtime** (`src/recomp/hidden_mansion.cpp`): `hm::versionField()` (the flags),
+`hm::mansionVariant()` (normal mansion), `hm::variant()` (Hidden Mansion; flag 8 alone still
+means PAL for older saves), `hm::rulesVariant()`, `hm::rules(v, hidden)` (the table below);
+`redirect()` serves the chosen release's files (European base, hidden: for `map2u.szp`); the PAL
+Hidden Mansion on the USA base and the USA one on the European base keep their overlays; the
+Japanese Hidden Mansion on the European base uses the "USA rules" flag hiding (its `event16/73`
+are the USA scripts; `map2u.szp` -> the Japanese `map2.szp`). `[rules]` log lines name the rules
+on every change (the line prints the release's table, including items not implemented on that
+base, below).
+
+| Rule | USA | Japan | PAL | Implemented on |
+|------|-----|-------|-----|----------------|
+| Small heart threshold (normal / hidden) | 200 / 400 | 100 / 100 | 200 / 1000 | every base (`fn_800E70BC`/`fn_800E7698` hooks correct the base's own compare) |
+| Damage x2 in the Hidden Mansion | yes | no | yes | USA/PAL base: `fn_800B9680` with the flag hidden; Japanese base: `fn_800B9488` doubles the hit |
+| A rank | 100 M | 100 M | 150 M | every base (`VA(0x8020BE18)`, rewritten while the rules differ) |
+| Chauncey stop distance | 15 | 10 | 20 (hidden 40) | USA base (patches 61/62; PAL hidden: existing hook), Japanese base (patches 62/63); not undone on the European base |
+| Bowser thrown bombs +0x1D4 = 90 | - | - | yes | USA base only (`fn_800A926C`, a USA-only hook); not undone on the European base |
+| Map data (ghost/item/heart tables, props, paths) | | | | every base (versions overlay) |
+
+Not done: the PAL `game.szp` item table, the USA death voice, the unidentified rows of 1.1, the
+European Hidden Mansion on the Japanese base, the Chauncey/Bowser undo on the European base,
+Bowser's 90 on the Japanese base.
+
+**F1 fallback** (one disc, or no versions overlay): Enhancements > General > *Mansion version*
+and *Hidden Mansion version* list USA / Japan / PAL, greyed with "needs the X disc"
+(settings `enhancements.mansion_version` 0 own / 1 USA / 2 Japan / 3 PAL, `hidden_mansion_jp`).
+With the lab menu installed they become a note ("chosen in E. Gadd's lab", this visit's version,
+missing discs). Test aids: `LM_MANSION_VARIANT=us|jp|pal`, `LM_HIDDEN_MANSION_VARIANT=us|jp|pal`.
+
+**Verified** (LuigisMansionRecomp with all three discs, scratch AppData/card, route
+`LM_START_MAP=1` + `LM_SKIP_TEST` flags 5/7, the follow-up picked with the stick): every
+combination enters the foyer, logs the expected `[rules]` line and serves the expected files:
+USA base: Mansion Japan / PAL, Hidden Japan / PAL; Japanese base: Mansion USA / PAL, Hidden USA /
+own; European base: Mansion USA / Japan, Hidden USA / Japan / own (only its own is mirrored).
+The base's own entry is the retail behaviour (nothing served). Saving and loading inside another
+release's mansion keeps the choice by construction (flags 0..84 are saved with the file); not
+run-tested. F1 ID sweep (`LM_MENU_ID_CHECK=exit`): 0 conflicts.

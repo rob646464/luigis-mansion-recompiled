@@ -442,7 +442,7 @@ bool buildVersionsOverlay(const std::vector<const Disc*>& discs, const std::file
             for (const char* f : kVersionFiles) {
                 Bytes b;
                 if (!d->readFile(f, b)) throw std::runtime_error(std::string("the ") + port::regionName(d->version()) + " disc has no " + f);
-                const auto dst = dir / std::filesystem::path(f + 1);
+                const auto dst = dir / std::filesystem::path(f + 1).make_preferred();  // (extended paths: '\' only)
                 std::filesystem::create_directories(dst.parent_path());
                 if (!writeFile(dst, b)) throw std::runtime_error("could not write the versions overlay");
                 manifest += std::string(port::gameId(d->version())) + " " + f + "\n";

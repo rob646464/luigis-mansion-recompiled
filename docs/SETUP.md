@@ -625,8 +625,10 @@ have, `fn_800B9680` damage x2, the debugger driver's newer SDK, a few game funct
   nothing to do. Memory cards go to `JAP/Card A`.
 - **Hidden Mansion.** The Japanese game has its own (docs/HIDDEN_MANSION.md "The Japanese
   game"): the USA rules minus damage x2 and the raised heart threshold. The European/USA
-  overlays and flag-hiding hooks are not applied on the Japanese base (`port::hiddenMansionPal/Us`
-  = `NotOnJpn`, `hm::jpBase()`).
+  two-variant overlays and flag-hiding hooks are not applied on the Japanese base
+  (`port::hiddenMansionPal/Us` = `NotOnJpn`, `hm::jpBase()`); with more discs, E. Gadd's lab
+  offers every release's mansion and the USA / Japanese Hidden Mansions there
+  (docs/VERSION_DIFFERENCES.md section 6; the European Hidden Mansion on the Japanese base: not yet).
 - **Not on the Japanese base yet** (F1 greys them, "not available on the Japanese version yet"):
   Mirrored Mansion (its USA-game hooks), leftover-room visits, the font test's Latin line. The
   Pikmin movie does not exist there.
@@ -650,8 +652,9 @@ the USA caches.
 | Leftover-room visits (Unused content > Unused rooms) | yes | *not available on the European version yet* | *not available on the Japanese version yet* |
 | Mirrored Mansion | yes | yes | *not available on the Japanese version yet* |
 | Hidden Mansion: European rules | with both discs (overlay) | native | not yet |
-| Hidden Mansion: USA rules | native | with both discs (reverse overlay) | not yet |
-| Hidden Mansion: Japanese rules | - | - | native |
+| Hidden Mansion: USA rules | native | with both discs (reverse overlay) | with the USA disc (versions overlay) |
+| Hidden Mansion: Japanese rules | with the Japanese disc (versions overlay) | with the Japanese disc | native |
+| The Mansion: another release's rules (docs/VERSION_DIFFERENCES.md section 6) | with its disc | with its disc | with its disc |
 | PAL refresh rate, language | *European version only* (greyed on a USA-only install) | yes | *European version only* |
 
 Rules: a single-disc install greys out what needs the other disc, with the reason
