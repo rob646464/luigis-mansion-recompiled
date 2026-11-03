@@ -183,6 +183,7 @@ add_executable(lmembed tools/recomp/lmembed.cpp)
 set(LM_EMBEDDED_FILES
     kSymbolsUs=decomp/config/GLME01/symbols.txt kSplitsUs=decomp/config/GLME01/splits.txt
     kSymbolsPal=decomp/config/GLMP01_00/symbols.txt kVersionMapPal=tools/recomp/GLMP01_map.txt
+    kSymbolsJp=decomp/config/GLMJ01/symbols.txt kVersionMapJp=tools/recomp/GLMJ01_map.txt
     kHooks=tools/recomp/hooks.txt kCtxHeader=src/recomp/ctx.h kModuleAbiHeader=src/recomp/module_abi.h
     kModuleRt=src/recomp/module_rt.cpp kRecompilerSource=src/recompiler/recompiler.cpp)
 set(_embed_deps)
@@ -286,10 +287,10 @@ endif ()
 
 # lmrecomp: developer build with the game recompiled at build time and linked in
 # statically (debuggable, no setup). LM_DOL is the user's own main.dol; LM_DOL_VERSION
-# selects the symbol map (GLME01, or GLMP01 for the European release).
+# selects the symbol map (GLME01, GLMP01 for the European release, GLMJ01 for the Japanese one).
 set(LM_DOL "${CMAKE_SOURCE_DIR}/Luigis Mansion US/sys/main.dol" CACHE FILEPATH
     "Path to your Luigi's Mansion main.dol, extracted from your own disc")
-set(LM_DOL_VERSION "GLME01" CACHE STRING "Release of LM_DOL: GLME01 (USA) or GLMP01 (Europe)")
+set(LM_DOL_VERSION "GLME01" CACHE STRING "Release of LM_DOL: GLME01 (USA), GLMP01 (Europe) or GLMJ01 (Japan)")
 if (EXISTS ${LM_DOL})
     set(LM_RECOMP_DIR ${CMAKE_BINARY_DIR}/recomp_gen)
     if (LM_DOL_VERSION STREQUAL "GLMP01")
@@ -297,6 +298,11 @@ if (EXISTS ${LM_DOL})
             --version-map ${CMAKE_SOURCE_DIR}/tools/recomp/GLMP01_map.txt)
         set(_recomp_deps ${CMAKE_SOURCE_DIR}/decomp/config/GLMP01_00/symbols.txt
             ${CMAKE_SOURCE_DIR}/tools/recomp/GLMP01_map.txt)
+    elseif (LM_DOL_VERSION STREQUAL "GLMJ01")
+        set(_recomp_cfg --symbols ${CMAKE_SOURCE_DIR}/decomp/config/GLMJ01/symbols.txt
+            --version-map ${CMAKE_SOURCE_DIR}/tools/recomp/GLMJ01_map.txt)
+        set(_recomp_deps ${CMAKE_SOURCE_DIR}/decomp/config/GLMJ01/symbols.txt
+            ${CMAKE_SOURCE_DIR}/tools/recomp/GLMJ01_map.txt)
     else ()
         set(_recomp_cfg --symbols ${CMAKE_SOURCE_DIR}/decomp/config/GLME01/symbols.txt
             --splits ${CMAKE_SOURCE_DIR}/decomp/config/GLME01/splits.txt)

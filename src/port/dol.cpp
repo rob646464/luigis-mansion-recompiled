@@ -76,6 +76,8 @@ constexpr uint8_t kShaGLME01[20] = {0x77, 0xd4, 0x92, 0x25, 0xe7, 0xd2, 0x8b, 0x
                                     0x6c, 0xdb, 0xe5, 0x80, 0x93, 0x45, 0xc5, 0x70, 0xec, 0xbc};
 constexpr uint8_t kShaGLMP01[20] = {0xa1, 0xe2, 0xbd, 0x82, 0x81, 0x37, 0x87, 0xcf, 0xe0, 0xb1,
                                     0x1a, 0xfb, 0x5d, 0x13, 0x8f, 0x08, 0xfd, 0xbd, 0x94, 0xf1};
+constexpr uint8_t kShaGLMJ01[20] = {0x72, 0x20, 0x05, 0xea, 0x9c, 0x1e, 0xab, 0x54, 0xb1, 0x14,
+                                    0xf8, 0x14, 0x73, 0x4d, 0x8f, 0x32, 0x7e, 0x56, 0x14, 0xee};  // (no decomp config: sys/main.dol of the user's dump)
 
 }  // namespace
 
@@ -84,6 +86,7 @@ Version identify(const uint8_t* dol, size_t size) {
     const auto digest = sha1(dol, size);
     if (std::memcmp(digest.data(), kShaGLME01, 20) == 0) return Version::GLME01;
     if (std::memcmp(digest.data(), kShaGLMP01, 20) == 0) return Version::GLMP01;
+    if (std::memcmp(digest.data(), kShaGLMJ01, 20) == 0) return Version::GLMJ01;
     return Version::Unknown;
 }
 
@@ -101,7 +104,7 @@ Version load() {
     }
     sVersion = identify(sDol, sDolSize);
     if (sVersion == Version::Unknown)
-        OSReport("[dol] main.dol does not match a supported retail build (GLME01/GLMP01 rev 0)\n");
+        OSReport("[dol] main.dol does not match a supported retail build (GLME01/GLMP01/GLMJ01 rev 0)\n");
     return sVersion;
 }
 

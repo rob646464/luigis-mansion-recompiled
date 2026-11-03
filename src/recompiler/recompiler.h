@@ -22,7 +22,7 @@ constexpr int kChunks = 32;
 
 struct Input {
     std::vector<std::uint8_t> dol;  // the retail main.dol
-    std::string version;            // "GLME01" or "GLMP01"
+    std::string version;            // "GLME01", "GLMP01" or "GLMJ01"
     std::string symbols;            // symbols.txt contents
     std::string splits;             // splits.txt contents (SDK translation-unit ranges)
     std::string hooks;              // tools/recomp/hooks.txt contents

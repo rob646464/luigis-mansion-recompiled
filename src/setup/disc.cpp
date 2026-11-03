@@ -40,13 +40,14 @@ bool Disc::open(const std::string& utf8Path, std::string& error) {
     switch (port::dol::identify(dol_.data(), dol_.size())) {
     case port::dol::Version::GLME01: version_ = port::GameVersion::USA; return true;
     case port::dol::Version::GLMP01: version_ = port::GameVersion::PAL; return true;
+    case port::dol::Version::GLMJ01: version_ = port::GameVersion::JPN; return true;
     default: break;
     }
     std::string id;
     if (meta.raw_boot.data && meta.raw_boot.size >= 6) id.assign(reinterpret_cast<const char*>(meta.raw_boot.data), 6);
     if (id.rfind("GLM", 0) == 0)
-        error = "This Luigi's Mansion disc (" + id + ") is not a supported release. Supported: USA (GLME01) and "
-                "Europe (GLMP01), first printing.";
+        error = "This Luigi's Mansion disc (" + id + ") is not a supported release. Supported: USA (GLME01), "
+                "Europe (GLMP01) and Japan (GLMJ01), first printing.";
     else
         error = "This is not a Luigi's Mansion disc" + (id.empty() ? std::string(".") : " (game ID " + id + ").");
     return false;

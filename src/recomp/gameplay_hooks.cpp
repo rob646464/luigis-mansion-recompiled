@@ -128,7 +128,7 @@ HLE(fn_800B9488) {
     // health", e.g. the new game's health = 100 on arriving in the mansion) are not damage.
     // Their values are scaled for "Luigi's health" in callLuigiMessage below.
     static const u32 sMsg = guestSymbol("fn_800AEEA8");
-    const bool scripted = c.lr >= sMsg && c.lr < sMsg + 0x2884;  // size of fn_800AEEA8 (both releases)
+    const bool scripted = c.lr >= sMsg && c.lr < sMsg + VOFF3(0x2884, 0x2884, 0x26AC);  // size of fn_800AEEA8
     if (scripted) return callOriginal(c, "fn_800B9488");
     const float k = current().damageScale;
     if (k != 1.0f) {

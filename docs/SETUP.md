@@ -26,13 +26,24 @@ The LLVM binaries are copied at install time, never committed. Toolchain lookup 
 ## Setup flow
 
 1. **Pick discs.** The setup screen (Dear ImGui on the Aurora window; SDL3
-   `SDL_ShowOpenFileDialog` for browsing) has a slot for the USA disc (GLME01) and one for
-   the European disc (GLMP01). Any image nod reads works (ISO/GCM, RVZ, WIA, GCZ, CISO,
-   WBFS, NFS, TGC). Each pick is validated at once (`setup/disc.cpp`): the image is
-   opened with nod and the SHA-1 of its `main.dol` must match a supported retail build
-   (`port::dol::identify`, hashes from `decomp/config/*/build.sha1`). A disc in the wrong
-   slot, another game or another revision gets a message.
-   One disc is enough; with both, the user picks the version to play (default USA).
+   `SDL_ShowOpenFileDialog` for browsing) has a slot for the USA disc (GLME01), one for
+   the European disc (GLMP01) and one for the Japanese disc (GLMJ01). Any image nod reads
+   works (ISO/GCM, RVZ, WIA, GCZ, CISO, WBFS, NFS, TGC). Each pick is validated at once
+   (`setup/disc.cpp`): the image is opened with nod and the SHA-1 of its `main.dol` must
+   match a supported retail build (`port::dol::identify`, hashes from
+   `decomp/config/*/build.sha1`; Japan: the user's dump, *The Japanese game* below). A disc
+   in the wrong slot, another game or another revision gets a message.
+   One disc is enough; with several, the user picks the version to play (default USA).
+
+   | Release | Game ID | Revision | main.dol SHA-1 | Function table | Version map | `install.ini` | Memory cards |
+   |---------|---------|----------|----------------|----------------|-------------|---------------|--------------|
+   | USA | GLME01 | 0 | `77d49225e7d28b9777916cdbe5809345c570ecbc` | `decomp/config/GLME01` (decomp, with TU splits) | - (USA names are canonical) | `us_disc` | `USA/Card A` |
+   | Europe | GLMP01 | 0 | `a1e2bd82813787cfe0b11afb5d138f08fdbd94f1` | `decomp/config/GLMP01_00` (decomp) | `tools/recomp/GLMP01_map.txt`, `version_addrs.inc` | `pal_disc` | `EUR/Card A` |
+   | Japan | GLMJ01 | 0 | `722005ea9c1eab54b114f814734d8f327e5614ee` | `decomp/config/GLMJ01` (decomp-toolkit, `tools/recomp/gen_jp_symbols.py`) | `tools/recomp/GLMJ01_map.txt`, `version_addrs_jp.inc` | `jpn_disc` | `JAP/Card A` |
+
+   `install.ini` also keeps `base=USA|PAL|JPN` (the version that runs) and, in portable
+   mode, `*_disc_rel`. The memory card folder follows the game ID's region letter (Aurora's
+   card layer), so each release keeps its own saves.
 2. **Install** (worker thread, progress bar, cancellable):
    - For each disc whose game module is missing or stale: recompile its `main.dol`
      (`src/recompiler`, in-process), write the 32 generated sources plus the shipped

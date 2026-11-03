@@ -299,7 +299,7 @@ public:
             // to be named the same (the unrelated PAL fn_80008D58) is renamed, so that names
             // (hooks, HLE, guestSymbol) stay unique.
             for (auto& [addr, f] : this->funcs)
-                if (!vmap->count(addr) && mapped.count(f.name)) f.name = "pal_" + f.name;
+                if (!vmap->count(addr) && mapped.count(f.name)) f.name = "ver_" + f.name;
         } else {
             for (auto& [addr, f] : this->funcs)
                 for (const auto& r : hleRanges)
@@ -1182,7 +1182,8 @@ bool recompile(const Input& in, Output& out, std::string& error) {
         // hooks.txt: "<symbol> [us] [pal]". A line applies to the US build unless it lists
         // only other versions, and to PAL only when tagged "pal" (hooks are written
         // against US code; a PAL tag means the hook was checked against the PAL build).
-        const bool pal = in.version == "GLMP01";
+        // Japanese build: tag "jp" (checked against the Japanese code, like "pal").
+        const bool pal = in.version == "GLMP01", jp = in.version == "GLMJ01";
         for (std::string_view line : splitLines(in.hooks)) {
             line = trim(line);
             if (line.empty() || line[0] == '#') continue;
@@ -1194,13 +1195,14 @@ bool recompile(const Input& in, Output& out, std::string& error) {
                 if (q > p) words.push_back(line.substr(p, q - p));
                 p = q + 1;
             }
-            bool tagUs = false, tagPal = false;
+            bool tagUs = false, tagPal = false, tagJp = false;
             const bool isPatch = words[0] == "patch";
             for (size_t i = isPatch ? 4 : 1; i < words.size(); i++) {
                 if (words[i] == "us") tagUs = true;
                 else if (words[i] == "pal") tagPal = true;
+                else if (words[i] == "jp") tagJp = true;
             }
-            const bool applies = pal ? tagPal : (tagUs || !tagPal);
+            const bool applies = pal ? tagPal : jp ? tagJp : (tagUs || (!tagPal && !tagJp));
             if (!applies) continue;
             if (isPatch) {  // "patch <id> <address> <instruction word> [us] [pal]"
                 u32 id = 0, addr = 0, word = 0;

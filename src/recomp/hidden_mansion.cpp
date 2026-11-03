@@ -36,6 +36,9 @@ namespace {
 // game they are its own, and the USA rules are restored by the reverse overlay and hooks
 // (docs/SETUP.md, "USA Hidden Mansion on the European game").
 bool usBase() { return port::install().running == port::GameVersion::USA; }
+// The Japanese game keeps its own Hidden Mansion: no overlay, no other rules, no flag hiding
+// (docs/HIDDEN_MANSION.md "The Japanese game"; port::hiddenMansionPal/Us are NotOnJpn there).
+bool jpBase() { return port::install().running == port::GameVersion::JPN; }
 
 // LM_HM_OVERLAY, else the overlay setup built in the data directory, else the first
 // orig/hidden_mansion (tools/hidden_mansion_data.py) found walking up from the working
@@ -188,6 +191,11 @@ Variant initialVariant() {
     sForced = !v.empty();
     if (v.empty()) v = port::settings().enhancements.hiddenMansionPal ? "pal" : "us";
     for (char& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (jpBase()) {
+        // Variant::Us stands for "the running game's own rules" here (palRulesActive is false).
+        log("[hm] Hidden Mansion variant: the Japanese game's own%s", sForced && v != "us" ? " (other variants: not on the Japanese game)" : "");
+        return Variant::Us;
+    }
     // A single-disc install only has its own release's rules (port::hiddenMansionPal/Us).
     bool pal = v != "us";
     if (pal && port::hiddenMansionPal() != port::Avail::Yes) pal = false;
@@ -291,11 +299,11 @@ void onFrame() {
     mirror::onFrame();
 }
 bool palActive() { return usBase() && variant() == Variant::Pal && hiddenActive(); }
-bool usaOnPalActive() { return !usBase() && variant() == Variant::Us && hiddenActive(); }
-bool palRulesActive() { return variant() == Variant::Pal && hiddenActive(); }
+bool usaOnPalActive() { return !usBase() && !jpBase() && variant() == Variant::Us && hiddenActive(); }
+bool palRulesActive() { return !jpBase() && variant() == Variant::Pal && hiddenActive(); }
 
 std::optional<std::string> redirect(const char* guestPath) {
-    if (!guestPath) return std::nullopt;
+    if (!guestPath || jpBase()) return std::nullopt;
     // Only the variant that is not the running game's own needs data from the other disc,
     // except the lab menu, which offers both.
     const bool reverse = !usBase();
@@ -348,6 +356,7 @@ s32 overlayRead(s32 entry, void* dst, s32 length, s32 offset) {
 }
 
 void syncConstants() {
+    if (jpBase()) return;  // (the patched literals below are USA / European addresses)
     if (!usBase()) {
         // European game: the hidden mansion's room ambient factor is a .sdata float (PAL-only
         // 0x804BD728, 0.2, read by the PAL-only fn_800179F8 when the flag is set). 1.0 = USA.
@@ -383,7 +392,7 @@ bool mirrorWorld() {
         log("[mirror] LM_MIRROR=%s", env);
         return *env == '0' ? 0 : 1;
     }();
-    const bool on = sEnv >= 0 ? sEnv == 1 : gameplay::current().mirrorWorld;
+    const bool on = !jpBase() && (sEnv >= 0 ? sEnv == 1 : gameplay::current().mirrorWorld);  // (not on the Japanese game yet)
     // Only in the main game scene (the scene manager's current scene, lbl_804CFF98), where the
     // mirror code runs; the title, file select and Options screens are other scenes.
     return on && rd32(VA(0x804CFF98)) == VA(0x8021DB68);

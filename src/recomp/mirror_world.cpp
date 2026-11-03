@@ -22,7 +22,7 @@ using gu::inMem1;
 // lbl_804CFF90: number of views the frame loop fn_8000BCE8 draws (fn_8000ADFC).
 #define kViewCount VA(0x804CFF90)
 
-bool usGame() { return !ver::pal(); }
+bool usGame() { return ver::usa(); }
 
 // ---- USA game: the European GBH map mirror (docs/HIDDEN_MANSION.md "Mirror") ----------------
 // European code, with the USA names of its functions:
@@ -94,7 +94,7 @@ constexpr u32 kPalMapSign = 0x804C5A10;
 }  // namespace
 
 void mapViewMatrix(Ctx& c) {
-    if (!sMapDraw || c.r[3] != kMapView || ver::pal()) return;
+    if (!sMapDraw || c.r[3] != kMapView || !ver::usa()) return;
     const u32 dst = scratch();
     if (!dst) return;
     for (u32 i = 0; i < 12; i++) {
@@ -139,7 +139,7 @@ bool swapSplitHalves() { return coop::fixes() && hm::mirrorOn(); }
 
 void onFrame() {
     // USA game: Luigi's map effect call goes to the fn_80164F58 hook while mirrored.
-    if (!ver::pal()) setPatch(kPatchMapEffect, hm::mirrorActive());
+    if (ver::usa()) setPatch(kPatchMapEffect, hm::mirrorActive());
     static bool sLast = false;
     const bool on = hm::mirrorOn();
     if (on == sLast) return;

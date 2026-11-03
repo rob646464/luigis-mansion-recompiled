@@ -244,7 +244,7 @@ std::filesystem::path moduleDir(port::GameVersion v) { return port::dataDir() / 
 std::filesystem::path modulePath(port::GameVersion v) { return moduleDir(v) / kModuleFile; }
 
 std::string moduleKey(const Disc& disc) {
-    const bool pal = disc.version() == port::GameVersion::PAL;
+    const port::GameVersion ver = disc.version();
     std::string text = "abi " + std::to_string(recomp::kModuleAbiVersion) + "\n";
     // The program version: an update (docs/SETUP.md "Updates") always rebuilds the module, also
     // for changes the embedded sources below do not show (headers the recompiler includes, the
@@ -253,7 +253,7 @@ std::string moduleKey(const Disc& disc) {
     text += std::string("game ") + port::gameId(disc.version()) + " " + disc.dolSha1() + "\n";
     for (auto& f : kCompileFlags) text += f + " ";
     for (auto& f : kLinkFlags) text += f + " ";
-    for (std::string_view part : {embedded::symbols(pal), embedded::splits(pal), embedded::versionMap(pal),
+    for (std::string_view part : {embedded::symbols(ver), embedded::splits(ver), embedded::versionMap(ver),
                                   embedded::hooks(), embedded::ctxHeader(), embedded::moduleAbiHeader(),
                                   embedded::moduleRt(), embedded::recompilerSource()}) {
         const auto d = port::dol::sha1(reinterpret_cast<const std::uint8_t*>(part.data()), part.size());
@@ -354,7 +354,7 @@ bool buildModule(const Disc& disc, const Progress& progress, std::string& error)
     std::fflush(stdout);
     const auto buildStart = std::chrono::steady_clock::now();
 
-    const bool pal = disc.version() == port::GameVersion::PAL;
+    const port::GameVersion ver = disc.version();
     const auto dir = moduleDir(disc.version());
     const auto work = dir / "build";
     std::error_code ec;
@@ -368,9 +368,9 @@ bool buildModule(const Disc& disc, const Progress& progress, std::string& error)
     lmrc::Input in;
     in.dol = disc.dol();
     in.version = port::gameId(disc.version());
-    in.symbols = std::string(embedded::symbols(pal));
-    in.splits = std::string(embedded::splits(pal));
-    in.versionMap = std::string(embedded::versionMap(pal));
+    in.symbols = std::string(embedded::symbols(ver));
+    in.splits = std::string(embedded::splits(ver));
+    in.versionMap = std::string(embedded::versionMap(ver));
     in.hooks = std::string(embedded::hooks());
     lmrc::Output out;
     if (!lmrc::recompile(in, out, error)) {

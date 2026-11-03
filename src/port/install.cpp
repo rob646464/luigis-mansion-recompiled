@@ -34,44 +34,59 @@ std::vector<std::string> sArgs;
 
 }  // namespace
 
-const char* gameId(GameVersion v) { return v == GameVersion::PAL ? "GLMP01" : "GLME01"; }
-const char* versionName(GameVersion v) { return v == GameVersion::PAL ? "PAL" : "USA"; }
+const char* gameId(GameVersion v) {
+    return v == GameVersion::PAL ? "GLMP01" : v == GameVersion::JPN ? "GLMJ01" : "GLME01";
+}
+const char* versionName(GameVersion v) { return v == GameVersion::PAL ? "PAL" : v == GameVersion::JPN ? "JPN" : "USA"; }
+const char* regionName(GameVersion v) {
+    return v == GameVersion::PAL ? "Europe" : v == GameVersion::JPN ? "Japan" : "USA";
+}
 
 Avail usCodeFeature() {
     const auto& i = sInstall;
     if (i.running == GameVersion::USA) return Avail::Yes;
-    return i.usReady ? Avail::OtherBase : Avail::NeedsUsDisc;
+    return i.usReady ? Avail::OtherBaseUs : Avail::NeedsUsDisc;
 }
 
 Avail palBaseFeature() {
     const auto& i = sInstall;
     if (i.running == GameVersion::PAL) return Avail::Yes;
-    return i.palReady ? Avail::OtherBase : Avail::NeedsPalDisc;
+    return i.palReady ? Avail::OtherBasePal : Avail::NeedsPalDisc;
 }
 
 // The other release's Hidden Mansion needs that release's data: the overlay setup builds from
-// both discs (docs/SETUP.md; PAL rules on the USA game, USA rules on the European game).
+// both discs (docs/SETUP.md; PAL rules on the USA game, USA rules on the European game). The
+// Japanese game keeps its own Hidden Mansion (docs/HIDDEN_MANSION.md "The Japanese game"): the
+// overlays and the flag-hiding hooks are written for the USA/European code.
 Avail hiddenMansionPal() {
     const auto& i = sInstall;
+    if (i.running == GameVersion::JPN) return Avail::NotOnJpn;
     if (i.running == GameVersion::PAL || i.hmOverlayReady) return Avail::Yes;
     return Avail::NeedsPalDisc;
 }
 
 Avail hiddenMansionUs() {
     const auto& i = sInstall;
+    if (i.running == GameVersion::JPN) return Avail::NotOnJpn;
     if (i.running == GameVersion::USA || i.hmOverlayReady) return Avail::Yes;
     return Avail::NeedsUsDisc;
+}
+
+Avail notOnJpn() { return sInstall.running == GameVersion::JPN ? Avail::NotOnJpn : Avail::Yes; }
+
+bool availGreyed(Avail a) {
+    return a == Avail::NeedsUsDisc || a == Avail::NeedsPalDisc || a == Avail::NotYet || a == Avail::NotOnJpn;
 }
 
 const char* availNote(Avail a) {
     switch (a) {
     case Avail::Yes: return nullptr;
-    case Avail::OtherBase:
-        return sInstall.running == GameVersion::USA ? "applies when playing the European version"
-                                                    : "applies when playing the USA version";
+    case Avail::OtherBaseUs: return "applies when playing the USA version";
+    case Avail::OtherBasePal: return "applies when playing the European version";
     case Avail::NeedsUsDisc: return "needs the USA disc: F1 > Game > Add or change discs";
     case Avail::NeedsPalDisc: return "needs the European disc: F1 > Game > Add or change discs";
     case Avail::NotYet: return "not available on the European version yet; play the USA version";
+    case Avail::NotOnJpn: return "not available on the Japanese version yet";
     }
     return nullptr;
 }
@@ -823,7 +838,7 @@ void findMovedDisc(std::string& disc, const std::string& rel) {
 
 void loadInstall() {
     std::ifstream in(longPath(configDir() / "install.ini"));
-    std::string line, usRel, palRel;
+    std::string line, usRel, palRel, jpnRel;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto eq = line.find('=');
@@ -831,12 +846,16 @@ void loadInstall() {
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
         if (key == "us_disc") sInstall.usDisc = value;
         else if (key == "pal_disc") sInstall.palDisc = value;
+        else if (key == "jpn_disc") sInstall.jpnDisc = value;
         else if (key == "us_disc_rel") usRel = value;
         else if (key == "pal_disc_rel") palRel = value;
-        else if (key == "base") sInstall.base = value == "PAL" ? GameVersion::PAL : GameVersion::USA;
+        else if (key == "jpn_disc_rel") jpnRel = value;
+        else if (key == "base")
+            sInstall.base = value == "PAL" ? GameVersion::PAL : value == "JPN" ? GameVersion::JPN : GameVersion::USA;
     }
     findMovedDisc(sInstall.usDisc, usRel);
     findMovedDisc(sInstall.palDisc, palRel);
+    findMovedDisc(sInstall.jpnDisc, jpnRel);
 }
 
 void saveInstall() {
@@ -847,6 +866,8 @@ void saveInstall() {
     if (portable) out << "us_disc_rel=" << relToExe(sInstall.usDisc) << '\n';
     out << "pal_disc=" << sInstall.palDisc << '\n';
     if (portable) out << "pal_disc_rel=" << relToExe(sInstall.palDisc) << '\n';
+    out << "jpn_disc=" << sInstall.jpnDisc << '\n';
+    if (portable) out << "jpn_disc_rel=" << relToExe(sInstall.jpnDisc) << '\n';
     out << "base=" << versionName(sInstall.base) << '\n';
 }
 

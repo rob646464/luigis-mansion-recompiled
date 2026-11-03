@@ -15,6 +15,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fstream>
 #include <iterator>
@@ -55,7 +56,9 @@ struct Job {
 
 // Results of the file dialogs (SDL may call back on another thread).
 std::mutex sPickM;
-std::optional<std::string> sPicked[2];
+// Slots are indexed by GameVersion: 0 USA, 1 Europe, 2 Japan.
+constexpr int kSlots = port::kGameVersions;
+std::optional<std::string> sPicked[kSlots];
 std::string sDialogError;  // the file dialog could not open (Linux: no xdg-desktop-portal/zenity)
 
 std::string readText(const std::filesystem::path& p) {
@@ -84,12 +87,15 @@ void validate(Slot& s, GameVersion expected) {
         return;
     }
     if (v != expected) {
-        s.message = std::string("This is the ") + (v == GameVersion::PAL ? "European" : "USA") +
-                    " disc; put it in the other slot.";
+        s.message = std::string("This is the ") +
+                    (v == GameVersion::PAL ? "European" : v == GameVersion::JPN ? "Japanese" : "USA") +
+                    " disc; put it in its own slot.";
         return;
     }
     s.valid = true;
-    s.message = v == GameVersion::PAL ? "Luigi's Mansion (Europe, GLMP01)" : "Luigi's Mansion (USA, GLME01)";
+    s.message = v == GameVersion::PAL   ? "Luigi's Mansion (Europe, GLMP01)"
+                : v == GameVersion::JPN ? "Luigi's Mansion (Japan, GLMJ01)"
+                                        : "Luigi's Mansion (USA, GLME01)";
 }
 
 struct Plan {
@@ -98,10 +104,10 @@ struct Plan {
     bool empty() const { return modules.empty() && !overlay; }
 };
 
-Plan makePlan(const Slot slots[2]) {
+Plan makePlan(const Slot slots[kSlots]) {
     Plan p;
-    std::unique_ptr<Disc> discs[2];
-    for (int i = 0; i < 2; i++) {
+    std::unique_ptr<Disc> discs[kSlots];
+    for (int i = 0; i < kSlots; i++) {
         if (!slots[i].valid) continue;
         discs[i] = std::make_unique<Disc>();
         std::string err;
@@ -115,8 +121,9 @@ Plan makePlan(const Slot slots[2]) {
     return p;
 }
 
-void startJob(Job& job, const Slot slots[2], const Plan& plan) {
-    const std::string paths[2] = {slots[0].valid ? slots[0].path : "", slots[1].valid ? slots[1].path : ""};
+void startJob(Job& job, const Slot slots[kSlots], const Plan& plan) {
+    std::array<std::string, kSlots> paths;
+    for (int i = 0; i < kSlots; i++) paths[i] = slots[i].valid ? slots[i].path : "";
     job.thread = std::thread([&job, paths, plan] {
         auto set = [&](const std::string& stage, float f) {
             std::lock_guard lk(job.m);
@@ -131,8 +138,8 @@ void startJob(Job& job, const Slot slots[2], const Plan& plan) {
         const float steps = float(plan.modules.size() + (plan.overlay ? 1 : 0));
         float step = 0.0f;
         for (GameVersion v : plan.modules) {
-            const int i = v == GameVersion::PAL ? 1 : 0;
-            const char* name = v == GameVersion::PAL ? "Europe" : "USA";
+            const int i = int(v);
+            const char* name = port::regionName(v);
             set(std::string("Reading the ") + name + " disc", step / steps);
             Disc disc;
             std::string err;
@@ -192,22 +199,37 @@ bool run(const Options& opts, LaunchInfo& launch) {
     recomp::ui::install(recomp::ui::Context::Setup);
     port::loadInstall();
     auto& inst = port::install();
-    Slot slots[2];
+    Slot slots[kSlots];
     slots[0].path = !opts.usDisc.empty() ? opts.usDisc : inst.usDisc;
     slots[1].path = !opts.palDisc.empty() ? opts.palDisc : inst.palDisc;
-    validate(slots[0], GameVersion::USA);
-    validate(slots[1], GameVersion::PAL);
+    slots[2].path = !opts.jpnDisc.empty() ? opts.jpnDisc : inst.jpnDisc;
+    for (int i = 0; i < kSlots; i++) validate(slots[i], GameVersion(i));
     GameVersion base = inst.base;
+    auto anyValid = [&] {
+        for (const Slot& s : slots)
+            if (s.valid) return true;
+        return false;
+    };
+    auto validCount = [&] {
+        int n = 0;
+        for (const Slot& s : slots) n += s.valid;
+        return n;
+    };
 
+    // The base must be an installed disc: else the first valid one (USA, Europe, Japan).
     auto chooseBase = [&] {
-        if (!slots[1].valid) base = GameVersion::USA;
-        else if (!slots[0].valid) base = GameVersion::PAL;
+        if (slots[int(base)].valid) return;
+        for (int i = 0; i < kSlots; i++)
+            if (slots[i].valid) {
+                base = GameVersion(i);
+                return;
+            }
     };
     chooseBase();
 
     // Nothing to ask: the configured discs are all readable and the base is available.
-    bool showUi = opts.forceUi || opts.autoStart || !(slots[0].valid || slots[1].valid) ||
-                  (!slots[0].path.empty() && !slots[0].valid) || (!slots[1].path.empty() && !slots[1].valid);
+    bool showUi = opts.forceUi || opts.autoStart || !anyValid();
+    for (const Slot& s : slots) showUi |= !s.path.empty() && !s.valid;
     Screen screen = Screen::Pick;
     std::unique_ptr<Job> job;
     Plan plan;
@@ -216,6 +238,7 @@ bool run(const Options& opts, LaunchInfo& launch) {
     auto begin = [&] {
         inst.usDisc = slots[0].valid ? slots[0].path : "";
         inst.palDisc = slots[1].valid ? slots[1].path : "";
+        inst.jpnDisc = slots[2].valid ? slots[2].path : "";
         inst.base = base;
         port::saveInstall();
         plan = makePlan(slots);
@@ -226,7 +249,7 @@ bool run(const Options& opts, LaunchInfo& launch) {
         started = true;
     };
     if (!showUi) begin();
-    else if (opts.autoStart && (slots[0].valid || slots[1].valid)) begin();
+    else if (opts.autoStart && anyValid()) begin();
 
     port::setPhase("setup");
     bool finished = false;
@@ -240,12 +263,12 @@ bool run(const Options& opts, LaunchInfo& launch) {
         }
         {
             std::lock_guard lk(sPickM);
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < kSlots; i++) {
                 if (sPicked[i]) {
                     slots[i].path = *sPicked[i];
                     sPicked[i].reset();
-                    validate(slots[i], i ? GameVersion::PAL : GameVersion::USA);
-                    if (slots[i].valid && !slots[1 - i].valid) base = slots[i].version;
+                    validate(slots[i], GameVersion(i));
+                    if (slots[i].valid && validCount() == 1) base = slots[i].version;
                     chooseBase();
                 }
             }
@@ -289,9 +312,10 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 ImGui::PopStyleColor();
             }
             ImGui::Dummy(ImVec2(0, 8 * scale));
-            const char* labels[2] = {"USA disc (GLME01)", "Europe disc (GLMP01)"};
-            const char* notes[2] = {"", "Playable on its own; with a USA disc it also adds the European Hidden Mansion."};
-            for (int i = 0; i < 2; i++) {
+            const char* labels[kSlots] = {"USA disc (GLME01)", "Europe disc (GLMP01)", "Japan disc (GLMJ01)"};
+            const char* notes[kSlots] = {"", "Playable on its own; with a USA disc it also adds the European Hidden Mansion.",
+                                         "Playable on its own (Japanese text, its own Hidden Mansion)."};
+            for (int i = 0; i < kSlots; i++) {
                 ImGui::PushID(i);
                 ImGui::Text("%s", labels[i]);
                 ImGui::SameLine();
@@ -302,7 +326,7 @@ bool run(const Options& opts, LaunchInfo& launch) {
                 // Linux: the file dialog needs xdg-desktop-portal (or zenity/kdialog); a typed or
                 // pasted path always works (docs/LINUX.md).
                 {
-                    static char typed[2][1024];
+                    static char typed[kSlots][1024];
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
                     const bool enter = ImGui::InputTextWithHint("##path", "or type / paste the path here",
@@ -342,16 +366,18 @@ bool run(const Options& opts, LaunchInfo& launch) {
                     ImGui::PopStyleColor();
                 }
             }
-            if (slots[0].valid && slots[1].valid) {
+            if (validCount() > 1) {
                 ImGui::Text("Version to play:");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("USA", base == GameVersion::USA)) base = GameVersion::USA;
-                ImGui::SameLine();
-                if (ImGui::RadioButton("Europe (50/60 Hz, languages)", base == GameVersion::PAL)) base = GameVersion::PAL;
-                ImGui::TextDisabled("Both versions are prepared; you can switch later in the F1 menu (Game tab).");
+                const char* names[kSlots] = {"USA", "Europe (50/60 Hz, languages)", "Japan"};
+                for (int i = 0; i < kSlots; i++) {
+                    if (!slots[i].valid) continue;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton(names[i], base == GameVersion(i))) base = GameVersion(i);
+                }
+                ImGui::TextDisabled("Every installed version is prepared; you can switch later in the F1 menu (Game tab).");
             }
             ImGui::Dummy(ImVec2(0, 8 * scale));
-            ImGui::BeginDisabled(!(slots[0].valid || slots[1].valid));
+            ImGui::BeginDisabled(!anyValid());
             if (ImGui::Button(started ? "Continue" : "Install and play")) begin();
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -409,12 +435,13 @@ bool run(const Options& opts, LaunchInfo& launch) {
     // Ready: report what is installed and what to launch.
     inst.usReady = slots[0].valid;
     inst.palReady = slots[1].valid;
+    inst.jpnReady = slots[2].valid;
     inst.hmOverlayReady = slots[0].valid && slots[1].valid &&
                           std::filesystem::exists(port::longPath(port::hiddenMansionOverlayDir() / "manifest.txt")) &&
                           std::filesystem::exists(port::longPath(port::hiddenMansionOverlayDir() / "usa" / "manifest.txt"));
     inst.running = base;
     launch.version = base;
-    launch.disc = slots[base == GameVersion::PAL ? 1 : 0].path;
+    launch.disc = slots[int(base)].path;
     launch.module = modulePath(base);
     return true;
 }
