@@ -20,6 +20,7 @@
 #include "recomp/silly_world.h"
 #include "recomp/silly.h"
 #include "recomp/skip.h"
+#include "recomp/texture_packs.h"
 #include "recomp/ui_scale.h"
 #include "recomp/unused2.h"
 
@@ -85,7 +86,7 @@ struct Page {
     const char* sub;
 };
 constexpr Page kPages[] = {
-    {"Visuals", "General"},       {"Visuals", "Rendering"},        {"Visuals", "Enhanced lighting"},
+    {"Visuals", "General"},       {"Visuals", "Rendering"},        {"Visuals", "Enhanced lighting"}, {"Visuals", "Texture packs"},
     {"Sound", nullptr},           {"Controls", "Ports"},           {"Controls", "Bindings"},
     {"Controls", "Analog"},       {"Controls", "DSU"},             {"Enhancements", "General"},     {"Enhancements", "Gameplay"},
     {"Enhancements", "Silly"},          {"Enhancements", "Unused content"}, {"Enhancements", "Debug"}, {"Game", nullptr},
@@ -2096,6 +2097,7 @@ bool SliderInt(const char* label, int* v, int min, int max, const char* format, 
 void draw() {
     click::frame();
     scriptedSettings();
+    recomp::texpacks::hostFrame();
     skip::drawOverlay();
     recomp::gx::applyAccuracySettings();
     recomp::enh::applySettings();
@@ -2160,6 +2162,10 @@ void draw() {
                     }
                     if (ImGui::BeginTabItem("Enhanced lighting", nullptr, envTab("Enhanced lighting"))) {
                         enhancedLightingTab();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Texture packs", nullptr, envTab("Texture packs"))) {
+                        sDirty |= recomp::texpacks::drawMenu();  // src/recomp/texture_packs.cpp
                         ImGui::EndTabItem();
                     }
                     ImGui::EndTabBar();

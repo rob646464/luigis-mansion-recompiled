@@ -1,0 +1,494 @@
+diff --git a/include/aurora/texture.hpp b/include/aurora/texture.hpp
+index 6c68778..af69fde 100644
+--- a/include/aurora/texture.hpp
++++ b/include/aurora/texture.hpp
+@@ -5,6 +5,7 @@
+ #include <filesystem>
+ #include <optional>
+ #include <span>
++#include <string>
+ #include <string_view>
+ #include <variant>
+ #include <vector>
+@@ -97,6 +98,39 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
+ 
+ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
+ 
++/// Texture dumping for texture-pack makers (CF 0360). While enabled, every static GX texture the
++/// renderer loads is written once per session to `directory` as an RGBA8 PNG named the way
++/// Dolphin's "Dump Textures" names it: tex1_{w}x{h}[_m]_{texhash}[_{tluthash}]_{fmt}.png, "_m"
++/// when the texture's min filter uses mipmaps, and (with `mips`) its mip levels as
++/// "{name}_mip{N}.png". Existing files are kept. PNG encoding and file writes run on a background
++/// thread. EFB copies are never dumped. Enabling re-resolves every cached texture so the textures
++/// of the current scene are dumped at once. An empty directory disables dumping.
++void set_texture_dump(const std::filesystem::path& directory, bool enabled, bool mips = true);
++
++/// Dolphin's file name (without extension) for a source key: "tex1_{w}x{h}[_m]_{hash}[_{tlut}]_{fmt}".
++std::string dolphin_texture_name(const TextureSourceKey& key, bool mipmapped);
++
++/// Logs (info) the first use of every replacement: its file and the key it replaced.
++void set_replacement_log(bool enabled);
++
++/// Replacement GPU cache budget in bytes (least recently used replacements beyond it are
++/// released and streamed in again when drawn). Default 4 GiB.
++void set_replacement_cache_budget(uint64_t bytes);
++
++struct ReplacementStats {
++  uint64_t registrations = 0;    // source-key replacement files/raw entries registered
++  uint64_t cachedTextures = 0;   // replacements resident on the GPU
++  uint64_t cachedBytes = 0;      // their estimated GPU bytes
++  uint64_t budgetBytes = 0;      // set_replacement_cache_budget
++  uint64_t pendingLoads = 0;     // full-resolution loads queued or decoding
++  uint64_t hits = 0;             // texture loads resolved to a replacement texture (since start)
++  uint64_t failed = 0;           // replacement files that failed to load
++  uint64_t dumped = 0;           // textures written by the dumper this session
++  uint64_t dumpSkipped = 0;      // dump names that already existed on disk
++  uint64_t dumpQueued = 0;       // waiting for the dump thread
++};
++ReplacementStats replacement_stats();
++
+ } // namespace aurora::texture
+ 
+ #endif
+diff --git a/lib/gfx/png_io.cpp b/lib/gfx/png_io.cpp
+index 9fb1379..3b76519 100644
+--- a/lib/gfx/png_io.cpp
++++ b/lib/gfx/png_io.cpp
+@@ -97,6 +97,57 @@ std::optional<ConvertedTexture> parse_png_bytes(ArrayRef<uint8_t> bytes) noexcep
+   };
+ }
+ 
++static void writePngData(png_structp png, png_bytep data, const size_t length) {
++  auto* out = static_cast<std::vector<uint8_t>*>(png_get_io_ptr(png));
++  out->insert(out->end(), data, data + length);
++}
++
++static void flushPngData(png_structp) {}
++
++bool encode_rgba8_png(uint32_t width, uint32_t height, ArrayRef<uint8_t> pixels, std::vector<uint8_t>& out) noexcept {
++  out.clear();
++  if (width == 0 || height == 0 || pixels.size() < size_t(width) * height * 4) {
++    return false;
++  }
++  png_structp pStruct = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
++  if (!pStruct) {
++    return false;
++  }
++  png_infop pInfo = png_create_info_struct(pStruct);
++  if (!pInfo) {
++    png_destroy_write_struct(&pStruct, nullptr);
++    return false;
++  }
++  std::vector<png_bytep> rows(height);
++  for (uint32_t y = 0; y < height; ++y) {
++    rows[y] = const_cast<png_bytep>(pixels.data() + size_t(y) * width * 4);
++  }
++  if (setjmp(png_jmpbuf(pStruct))) {
++    png_destroy_write_struct(&pStruct, &pInfo);
++    out.clear();
++    return false;
++  }
++  png_set_write_fn(pStruct, &out, writePngData, flushPngData);
++  // Fast deflate: dumps are written while the game runs (pack makers re-encode anyway).
++  png_set_compression_level(pStruct, 3);
++  png_set_IHDR(pStruct, pInfo, width, height, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
++               PNG_FILTER_TYPE_DEFAULT);
++  png_write_info(pStruct, pInfo);
++  png_write_image(pStruct, rows.data());
++  png_write_end(pStruct, nullptr);
++  png_destroy_write_struct(&pStruct, &pInfo);
++  return true;
++}
++
++bool write_rgba8_png(const std::filesystem::path& path, uint32_t width, uint32_t height,
++                     ArrayRef<uint8_t> pixels) noexcept {
++  std::vector<uint8_t> encoded;
++  if (!encode_rgba8_png(width, height, pixels, encoded)) {
++    return false;
++  }
++  return io::write_file(path, {encoded.data(), encoded.size()});
++}
++
+ std::optional<ConvertedTexture>
+ load_png_file(const std::filesystem::path& path) noexcept {
+   const auto bytes = io::read_file(path);
+diff --git a/lib/gfx/png_io.hpp b/lib/gfx/png_io.hpp
+index 3e15fbf..7888dec 100644
+--- a/lib/gfx/png_io.hpp
++++ b/lib/gfx/png_io.hpp
+@@ -2,10 +2,15 @@
+ 
+ #include <filesystem>
+ #include <optional>
++#include <vector>
+ 
+ #include "texture_convert.hpp"
+ 
+ namespace aurora::gfx::png {
+ std::optional<ConvertedTexture> parse_png_bytes(ArrayRef<uint8_t> bytes) noexcept;
+ std::optional<ConvertedTexture> load_png_file(const std::filesystem::path& path) noexcept;
++// RGBA8 rows (width * 4 bytes each, top first) as a PNG file (texture dumps).
++bool encode_rgba8_png(uint32_t width, uint32_t height, ArrayRef<uint8_t> pixels, std::vector<uint8_t>& out) noexcept;
++bool write_rgba8_png(const std::filesystem::path& path, uint32_t width, uint32_t height,
++                     ArrayRef<uint8_t> pixels) noexcept;
+ } // namespace aurora::gfx::png
+diff --git a/lib/gfx/texture_replacement.cpp b/lib/gfx/texture_replacement.cpp
+index 03dda46..b671fdf 100644
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <charconv>
+ #include <chrono>
+ #include <condition_variable>
+@@ -42,7 +43,7 @@ namespace aurora::texture {
+ namespace {
+ constexpr Module Log{"aurora::texture"};
+ 
+-constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
++uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB (set_replacement_cache_budget, CF 0360)
+ constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
+ constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
+ 
+@@ -1119,6 +1120,22 @@ std::optional<ReplacementKey> find_source_replacement_key_locked(const TextureSo
+   return std::nullopt;
+ }
+ 
++// CF 0360: lookups that returned a replacement texture (cumulative), and the optional log of the
++// first use of each replacement (set_replacement_log).
++std::atomic<uint64_t> s_replacementHitsTotal = 0;
++std::atomic<bool> s_replacementLog = false;
++absl::flat_hash_set<uint64_t> s_loggedIds;  // under s_registryMutex
++
++void note_replacement_used(const ReplacementKey& key, const ReplacementEntry& entry) noexcept {
++  s_replacementHitsTotal.fetch_add(1, std::memory_order_relaxed);
++  if (!s_replacementLog.load(std::memory_order_relaxed) || !s_loggedIds.insert(entry.id).second) {
++    return;
++  }
++  const auto* sourceKey = std::get_if<TextureSourceKey>(&key);
++  Log.info("texture_replacement: using {} for {}", entry_path_for_log(entry),
++           sourceKey != nullptr ? format_source_key_for_log(*sourceKey) : std::string{"a pointer key"});
++}
++
+ gfx::TextureHandle load_entry_handle(const ReplacementKey& key, const ReplacementEntry& entry) noexcept {
+   if (s_failedIds.contains(entry.id)) {
+     return {};
+@@ -1156,6 +1173,9 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
+     if (cache->second.tier == Tier::Thumbnail && !s_failedIds.contains(entry->id)) {
+       queue_full_load(snapshot_entry(key, *entry));
+     }
++    if (cache->second.handle) {
++      note_replacement_used(key, *entry);
++    }
+     return gfx::texture_replacement::ReplacementResult{.handle = cache->second.handle, .id = entry->id};
+   }
+ 
+@@ -1185,6 +1205,7 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
+     return gfx::texture_replacement::ReplacementResult{.id = entry->id};
+   }
+   cache_replacement_locked(key, entry->id, handle, Tier::Full);
++  note_replacement_used(key, *entry);
+   return gfx::texture_replacement::ReplacementResult{.handle = std::move(handle), .id = entry->id};
+ }
+ 
+@@ -1375,8 +1396,168 @@ ReplacementRegistration register_file_replacement(TextureSourceKey key, std::fil
+   gx::clear_static_texture_cache();
+   return registration;
+ }
++
++// ---- Texture dumping (CF 0360) ----------------------------------------------------------------
++// Dolphin-compatible dumps for pack makers: decode on the calling (render) thread while the
++// texture's memory is what was drawn, encode + write on one background thread.
++struct DumpJob {
++  std::filesystem::path path;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  ByteBuffer pixels;
++};
++
++std::mutex s_dumpMutex;
++std::condition_variable s_dumpCv;
++std::condition_variable s_dumpRoomCv;
++std::deque<DumpJob> s_dumpJobs;
++uint64_t s_dumpQueuedBytes = 0;
++constexpr uint64_t kDumpQueueMaxBytes = 128ull * 1024ull * 1024ull;
++std::atomic<bool> s_dumpEnabled = false;
++bool s_dumpMips = true;
++std::filesystem::path s_dumpDir;
++absl::flat_hash_set<std::string> s_dumpedNames;  // this session (under s_dumpMutex)
++std::atomic<uint64_t> s_dumpWritten = 0;
++std::atomic<uint64_t> s_dumpSkipped = 0;
++thread::Thread s_dumpThread;
++
++void dump_worker(std::stop_token token) {
++  std::stop_callback notifyOnStop{token, [] { s_dumpCv.notify_all(); }};
++  while (true) {
++    DumpJob job;
++    {
++      std::unique_lock lock{s_dumpMutex};
++      s_dumpCv.wait(lock, [&] { return token.stop_requested() || !s_dumpJobs.empty(); });
++      if (s_dumpJobs.empty()) {
++        return;  // stop requested and nothing left
++      }
++      job = std::move(s_dumpJobs.front());
++      s_dumpJobs.pop_front();
++    }
++    std::error_code ec;
++    if (std::filesystem::exists(job.path, ec)) {
++      s_dumpSkipped.fetch_add(1, std::memory_order_relaxed);
++    } else if (gfx::png::write_rgba8_png(job.path, job.width, job.height, {job.pixels.data(), job.pixels.size()})) {
++      s_dumpWritten.fetch_add(1, std::memory_order_relaxed);
++    } else {
++      Log.warn("texture dump: could not write {}", io::fs_path_to_string(job.path));
++    }
++    {
++      std::lock_guard lock{s_dumpMutex};
++      s_dumpQueuedBytes -= std::min<uint64_t>(s_dumpQueuedBytes, job.pixels.size());
++    }
++    s_dumpRoomCv.notify_all();
++  }
++}
++
++void stop_dump_thread() {
++  if (s_dumpThread.joinable()) {
++    s_dumpThread.request_stop();
++    s_dumpCv.notify_all();
++    s_dumpThread.join();
++  }
++  s_dumpThread = {};
++}
++
++// Dolphin's mip test: TexMode0's mipmap filter (bits 5-6, hardware encoding) is not "none".
++bool dolphin_mipmapped(const GXTexObj_& obj) noexcept { return ((obj.mode0 >> 5) & 3u) != 0; }
++
++// Levels Dolphin gives the texture: (max_lod + 15) / 16 extra levels, limited to the chain down to 1x1.
++uint32_t dolphin_level_count(const GXTexObj_& obj) noexcept {
++  if (!dolphin_mipmapped(obj)) {
++    return 1;
++  }
++  const uint32_t raw = (((obj.mode1 >> 8) & 0xffu) + 0xf) / 0x10;
++  uint32_t log2 = 0;
++  for (uint32_t d = std::max(obj.width(), obj.height()); d > 1; d >>= 1) {
++    ++log2;
++  }
++  return std::min(log2 + 1, raw + 1);
++}
++
++void queue_dump(DumpJob job) {
++  std::unique_lock lock{s_dumpMutex};
++  // Bounded: a burst (a new scene) waits for the writer instead of holding hundreds of MB.
++  s_dumpRoomCv.wait(lock, [] { return s_dumpQueuedBytes < kDumpQueueMaxBytes || !s_dumpEnabled; });
++  s_dumpQueuedBytes += job.pixels.size();
++  s_dumpJobs.push_back(std::move(job));
++  if (!s_dumpThread.joinable()) {
++    s_dumpThread = thread::Thread{thread::Options{.name = "Aurora texture dump", .priority = thread::Priority::Low},
++                                  dump_worker};
++  }
++  lock.unlock();
++  s_dumpCv.notify_one();
++}
+ } // namespace
+ 
++std::string dolphin_texture_name(const TextureSourceKey& key, bool mipmapped) {
++  if (key.hasTlut) {
++    return fmt::format("tex1_{}x{}{}_{:016x}_{:016x}_{}", key.width, key.height, mipmapped ? "_m" : "",
++                       key.textureHash, key.tlutHash, key.format);
++  }
++  return fmt::format("tex1_{}x{}{}_{:016x}_{}", key.width, key.height, mipmapped ? "_m" : "", key.textureHash,
++                     key.format);
++}
++
++void set_texture_dump(const std::filesystem::path& directory, bool enabled, bool mips) {
++  const bool on = enabled && !directory.empty();
++  {
++    std::lock_guard lock{s_dumpMutex};
++    if (on && directory != s_dumpDir) {
++      s_dumpedNames.clear();
++    }
++    s_dumpDir = directory;
++    s_dumpMips = mips;
++    if (on) {
++      io::create_directories(directory);
++    }
++  }
++  const bool was = s_dumpEnabled.exchange(on);
++  s_dumpRoomCv.notify_all();
++  if (on && !was) {
++    // Textures already in the texture object cache are resolved again (and so dumped).
++    gx::clear_static_texture_cache();
++    Log.info("texture dump: on, into {}", io::fs_path_to_string(directory));
++  } else if (!on && was) {
++    Log.info("texture dump: off ({} written, {} already there)", s_dumpWritten.load(), s_dumpSkipped.load());
++  }
++}
++
++void set_replacement_log(bool enabled) {
++  s_replacementLog = enabled;
++  if (enabled) {
++    std::lock_guard lk(s_registryMutex);
++    s_loggedIds.clear();
++  }
++}
++
++void set_replacement_cache_budget(uint64_t bytes) {
++  std::lock_guard lk(s_registryMutex);
++  kReplacementCacheBudgetBytes = std::max<uint64_t>(bytes, 64ull * 1024ull * 1024ull);
++  evict_replacement_cache_if_needed();
++}
++
++ReplacementStats replacement_stats() {
++  ReplacementStats stats;
++  {
++    std::lock_guard lk(s_registryMutex);
++    stats.registrations = s_sourceEntryCount;
++    stats.cachedTextures = s_cacheByKey.size();
++    stats.cachedBytes = s_replacementCacheBytes;
++    stats.budgetBytes = kReplacementCacheBudgetBytes;
++    stats.failed = s_failedIds.size();
++  }
++  stats.pendingLoads = pending_full_load_count();
++  stats.hits = s_replacementHitsTotal.load(std::memory_order_relaxed);
++  stats.dumped = s_dumpWritten.load(std::memory_order_relaxed);
++  stats.dumpSkipped = s_dumpSkipped.load(std::memory_order_relaxed);
++  {
++    std::lock_guard lock{s_dumpMutex};
++    stats.dumpQueued = s_dumpJobs.size();
++  }
++  return stats;
++}
++
+ std::optional<TextureSourceKey> parse_replacement_filename(std::string_view filename) noexcept {
+   const size_t dot = filename.rfind('.');
+   if (dot == std::string_view::npos) {
+@@ -1702,10 +1883,78 @@ namespace aurora::gfx::texture_replacement {
+ using namespace aurora::texture;
+ 
+ void shutdown() noexcept {
++  s_dumpEnabled = false;
++  s_dumpRoomCv.notify_all();
++  stop_dump_thread();  // writes what is queued first
+   clear_replacements();
+   stop_worker_pool();
+ }
+ 
++bool dumping() noexcept { return s_dumpEnabled.load(std::memory_order_relaxed); }
++
++void note_texture_for_dump(const GXTexObj_& obj, const GXTlutObj_* tlut, const TextureSourceKey& sourceKey) noexcept {
++  if (!dumping() || !obj.has_data()) {
++    return;
++  }
++  const bool mipmapped = dolphin_mipmapped(obj);
++  const std::string name = dolphin_texture_name(sourceKey, mipmapped);
++  std::filesystem::path dir;
++  bool mips = true;
++  {
++    std::lock_guard lock{s_dumpMutex};
++    if (!s_dumpedNames.insert(name).second) {
++      return;
++    }
++    dir = s_dumpDir;
++    mips = s_dumpMips;
++  }
++  if (dir.empty()) {
++    return;
++  }
++
++  const uint32_t width = obj.width();
++  const uint32_t height = obj.height();
++  // Levels the texture's memory holds (what Aurora uploads) and what Dolphin would dump.
++  const uint32_t levels = std::max(1u, mips ? std::min(dolphin_level_count(obj), obj.mip_count()) : 1u);
++  const size_t texBytes = gx::texture::texture_source_size(obj.format(), width, height, levels);
++  if (texBytes == 0) {
++    return;
++  }
++  const ArrayRef texData{static_cast<const uint8_t*>(obj.data), texBytes};
++  gfx::ConvertedTexture pixels;
++  if (gx::is_palette_format(obj.format())) {
++    if (tlut == nullptr || tlut->data == nullptr) {
++      return;
++    }
++    pixels = gfx::convert_texture_palette(obj.format(), width, height, levels, texData, tlut->format, tlut->numEntries,
++                                          tlut_bytes(*tlut));
++  } else {
++    pixels = gfx::convert_texture(obj.format(), width, height, levels, texData);
++  }
++  if (pixels.data.empty() || pixels.format != wgpu::TextureFormat::RGBA8Unorm) {
++    return;
++  }
++
++  size_t offset = 0;
++  for (uint32_t level = 0; level < levels; ++level) {
++    const uint32_t w = std::max(width >> level, 1u);
++    const uint32_t h = std::max(height >> level, 1u);
++    const size_t bytes = size_t(w) * h * 4;
++    if (offset + bytes > pixels.data.size()) {
++      break;
++    }
++    DumpJob job{
++        .path = dir / (level == 0 ? name + ".png" : fmt::format("{}_mip{}.png", name, level)),
++        .width = w,
++        .height = h,
++        .pixels = ByteBuffer{bytes},
++    };
++    std::memcpy(job.pixels.data(), pixels.data.data() + offset, bytes);
++    offset += bytes;
++    queue_dump(std::move(job));
++  }
++}
++
+ StreamingStats process_streaming() noexcept {
+   if constexpr (!gx::texture::AsyncTextureReplacements) {
+     return {};
+@@ -1846,6 +2095,9 @@ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
+ }
+ 
+ bool should_build_source_key() noexcept {
++  if (dumping()) {
++    return true;
++  }
+   std::lock_guard lk(s_registryMutex);
+   return s_sourceEntryCount != 0 || g_config.allowTextureDumps;
+ }
+diff --git a/lib/gfx/texture_replacement.hpp b/lib/gfx/texture_replacement.hpp
+index e99514d..97a515b 100644
+--- a/lib/gfx/texture_replacement.hpp
++++ b/lib/gfx/texture_replacement.hpp
+@@ -26,6 +26,11 @@ bool has_replacement(const GXTexObj_& obj) noexcept;
+ bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept;
+ std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept;
+ std::string build_texture_replacement_name(const texture::TextureSourceKey& sourceKey) noexcept;
++// Texture dumping (aurora::texture::set_texture_dump): whether it is on, and the hook the texture
++// cache calls for every static texture it resolves with a source key (dumped once per key).
++bool dumping() noexcept;
++void note_texture_for_dump(const GXTexObj_& obj, const GXTlutObj_* tlut,
++                           const texture::TextureSourceKey& sourceKey) noexcept;
+ 
+ namespace testing {
+ void set_workers_paused(bool paused) noexcept;
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index 09d46b0..daf8840 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -616,6 +616,9 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     const bool buildSourceKey = gfx::texture_replacement::should_build_source_key() || BuildSourceKeyForDebug;
+     keys = hash_texture_source(obj, nullptr, buildSourceKey);
+     if (keys->sourceKey.has_value()) {
++      if (gfx::texture_replacement::dumping()) {
++        gfx::texture_replacement::note_texture_for_dump(obj, nullptr, *keys->sourceKey);
++      }
+       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
+     }
+   }
+@@ -669,6 +672,9 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+   if (!use_replacement(gfx::texture_replacement::find_pointer_replacement(obj), handle, replacementId)) {
+     keys = hash_texture_source(obj, &tlut, gfx::texture_replacement::should_build_source_key());
+     if (keys->sourceKey.has_value()) {
++      if (gfx::texture_replacement::dumping()) {
++        gfx::texture_replacement::note_texture_for_dump(obj, &tlut, *keys->sourceKey);
++      }
+       use_replacement(gfx::texture_replacement::find_source_replacement(obj, *keys->sourceKey), handle, replacementId);
+     }
+   }

@@ -30,6 +30,7 @@
 #include "recomp/precache.h"
 #include "recomp/runtime.h"
 #include "recomp/sched.h"
+#include "recomp/texture_packs.h"
 #include "recomp/widescreen.h"
 #ifndef LM_STATIC_MODULE
 #include "setup/setup.h"
@@ -388,6 +389,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
     std::printf("Opened %s (%s)\n", disc.c_str(), discId);
+    texpacks::init(discId);  // texture packs + dumper (docs/TEXTURE_PACKS.md), loaded in the background
 
     frame::start(&boot);
     if (std::getenv("LM_WATCHDOG")) {
@@ -548,6 +550,7 @@ int main(int argc, char* argv[]) {
     vi::stopTimer();
     frame::stop();
     audio::outShutdown();
+    texpacks::shutdown();
     aurora_shutdown();
     port::recovery::onExit();
     std::_Exit(0);

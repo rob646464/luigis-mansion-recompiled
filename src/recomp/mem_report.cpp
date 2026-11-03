@@ -2,6 +2,7 @@
 
 #include "recomp/frame.h"
 #include "recomp/hle.h"
+#include "recomp/texture_packs.h"
 
 #include <aurora/mem_stats.h>
 
@@ -165,6 +166,7 @@ void report() {
     u32 tex = 0, texFree = 0, tlut = 0, tlutFree = 0;
     gxObjectTables(tex, texFree, tlut, tlutFree);
     log("[mem] port: texture objects %u (%u free), TLUT objects %u (%u free)", tex, texFree, tlut, tlutFree);
+    texpacks::memReport();
     trackReport();
 }
 
