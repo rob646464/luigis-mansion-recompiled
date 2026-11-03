@@ -51,8 +51,9 @@ std::string imageKey(const std::string& path) {
     if (ec) return {};
     const auto time = std::filesystem::last_write_time(p, ec);
     if (ec) return {};
+    // libc++ on macOS counts file times in __int128, which has no std::to_string.
     return std::string(kCacheFormat) + "|" + path + "|" + std::to_string(size) + "|" +
-           std::to_string(time.time_since_epoch().count());
+           std::to_string(static_cast<long long>(time.time_since_epoch().count()));
 }
 
 }  // namespace
