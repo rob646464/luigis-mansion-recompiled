@@ -25,6 +25,9 @@ public:
     std::string dolSha1() const;  // hex
     // Reads a whole file by disc path ("/Map/map2.szp"); false if missing.
     bool readFile(const char* path, std::vector<std::uint8_t>& out) const;
+    // Size and CRC-32 (zlib's) of a file, read in pieces; false if missing or unreadable
+    // (`found` tells which). For the disc image check (disc_check.h).
+    bool fileCrc(const char* path, std::uint32_t& size, std::uint32_t& crc, bool& found) const;
 
 private:
     NodHandle* disc_ = nullptr;

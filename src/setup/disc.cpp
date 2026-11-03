@@ -4,6 +4,8 @@
 
 #include <nod.h>
 
+#include <algorithm>
+
 namespace setup {
 
 std::string hex(const std::uint8_t* data, size_t n) {
@@ -69,6 +71,50 @@ bool Disc::readFile(const char* path, std::vector<std::uint8_t>& out) const {
     while (done < length) {
         const int64_t n = nod_read(file, out.data() + done, length - done);
         if (n <= 0) break;
+        done += size_t(n);
+    }
+    nod_free(file);
+    return done == length;
+}
+
+namespace {
+// CRC-32 (IEEE 802.3, reflected 0xEDB88320; zlib.crc32), slicing-by-1 table.
+struct CrcTable {
+    std::uint32_t t[256];
+    CrcTable() {
+        for (std::uint32_t i = 0; i < 256; i++) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+    }
+};
+std::uint32_t crcUpdate(std::uint32_t crc, const std::uint8_t* p, size_t n) {
+    static const CrcTable table;
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++) crc = table.t[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+}  // namespace
+
+bool Disc::fileCrc(const char* path, std::uint32_t& size, std::uint32_t& crc, bool& found) const {
+    NodNodeKind kind{};
+    uint32_t length = 0;
+    found = false;
+    size = 0;
+    crc = 0;
+    const uint32_t index = nod_partition_find_file(part_, path, &kind, &length);
+    if (index == NOD_FST_STOP) return false;
+    found = true;
+    size = length;
+    NodHandle* file = nullptr;
+    if (nod_partition_open_file(part_, index, &file) != NOD_RESULT_OK) return false;
+    static thread_local std::vector<std::uint8_t> buf(1u << 20);
+    size_t done = 0;
+    while (done < length) {
+        const int64_t n = nod_read(file, buf.data(), std::min<size_t>(buf.size(), length - done));
+        if (n <= 0) break;
+        crc = crcUpdate(crc, buf.data(), size_t(n));
         done += size_t(n);
     }
     nod_free(file);

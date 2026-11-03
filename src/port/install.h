@@ -25,6 +25,9 @@ struct InstallState {
     GameVersion running = GameVersion::USA;  // version of the game that is running
 
     bool staticBuild = false;  // lmrecomp: one version linked in, no setup
+    // The running disc image's files differ from the retail disc (setup's disc check, docs/SETUP.md
+    // "Disc image check"): one line naming them, for crash reports. Empty: matches, or not checked.
+    std::string discProblem;
 
     bool both() const { return usReady && palReady; }
 };

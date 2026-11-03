@@ -62,6 +62,35 @@ Later launches skip the screen when the configured discs are readable and every 
 and overlay is current; they are rebuilt automatically when stale. `--setup` (or F1 >
 Game > *Add or change discs...*) opens the screen again.
 
+### Disc image check
+
+The DOL check above only covers `main.dol`. Issue #37: an image with a retail DOL but
+damaged or modified game files started, then crashed on START at the title screen, at every
+start (`call to null (lr=80047B20) r3=80B9A7E0 vtable=B04FFE00`: the file select screen,
+`fn_80047A1C`, mounts `/Kawano/ENGLISH/res_slct.szp` and calls the archive's `getResource`
+through a vtable read from the file's own bytes; the same log also showed JAudio falling back
+to `Seqs/JaiSeInf.bst` / `JaiArcS.hed` and `open failed: /`, which is what a broken
+`/AudioRes/JaiInit.aaf` does, and a failed 0x44-byte allocation in
+`BootScene::dvdFileOpenCallback`, the game archive `/Game/game_usa.szp` not fitting the game
+heap). Reproduced byte for byte on a retail image with only the first 0x40 bytes of
+`res_slct.szp` zeroed.
+
+Now setup compares every file of the image with the retail disc's (`src/setup/disc_check.cpp`:
+size and CRC-32 per file, tables `src/setup/disc_files_<ID>.inc` generated from clean dumps by
+`tools/gen_disc_files.py`; no game data, only the checksums). It runs on a worker thread
+before the game starts, also for installs that were set up before (a "Checking the disc
+image" step, 0.6-1 s for an ISO), and the result is cached in `<dataDir>/disc_check_<ID>.txt`
+keyed by the image's path, size and modification time. A mismatch:
+
+- opens the setup screen with a warning under the disc slot naming the files that differ and
+  what to do (new dump, Dolphin's Properties > Verify); "Play anyway" starts it and is
+  remembered for that image (`accepted` in the cache; `--setup-auto` accepts too);
+- is logged as `[disc] USA image check: N of 847 game files differ ...` at every start;
+- is appended to a fatal error (`[recomp FATAL] probable cause: the disc image is damaged or
+  modified: ...`) and to the next start's `[recovery]` line (`port::install().discProblem`).
+
+Test aids: `LM_DISC_CHECK=0` skips the check, `LM_DISC_CHECK=force` ignores the cache.
+
 ### What lives where (`%APPDATA%\Luigi's Mansion Recompiled`)
 
 Linux: the XDG config/data/cache folders of the same name (docs/LINUX.md). Portable mode (below):
