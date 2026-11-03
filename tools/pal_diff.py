@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 DUMPS = next((p for p in [ROOT, *ROOT.parents] if (p / "Luigis Mansion US").exists()), ROOT)
 DEF_US = DUMPS / "Luigis Mansion US"
 DEF_PAL = DUMPS / "Lugis Mansion PAL"
+DEF_JP = DUMPS / "Luigis Mansion JP"
 
 SYM_RE = re.compile(r"(\S+) = (\.?\w+):0x([0-9A-Fa-f]+); // type:(\w+)(?: size:0x([0-9A-Fa-f]+))?")
 
@@ -815,7 +816,10 @@ def cmd_var(a, us, pal):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--us", default=str(DEF_US))
-    ap.add_argument("--pal", dest="pal_disc", default=str(DEF_PAL))
+    ap.add_argument("--pal", dest="pal_disc", default=None)
+    ap.add_argument("--jp", action="store_true",
+                    help="compare US with the Japanese GLMJ01 instead of PAL (the 'pal' side is then the "
+                         "Japanese game; needs decomp/config/GLMJ01 from branch japan-support)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("code")
     c.add_argument("--tsv")
@@ -851,7 +855,10 @@ def main():
     va.add_argument("--size", default="4")
     a = ap.parse_args()
     us = Version("US ", a.us, "GLME01")
-    pal = Version("PAL", a.pal_disc, "GLMP01_00")
+    if a.jp:
+        pal = Version("JP ", a.pal_disc or str(DEF_JP), "GLMJ01")
+    else:
+        pal = Version("PAL", a.pal_disc or str(DEF_PAL), "GLMP01_00")
     {"code": cmd_code, "show": cmd_show, "data": cmd_data, "files": cmd_files,
      "strings": cmd_strings, "xref": cmd_xref, "var": cmd_var, "field": cmd_field, "arcdiff": cmd_arcdiff}[a.cmd](a, us, pal)
 

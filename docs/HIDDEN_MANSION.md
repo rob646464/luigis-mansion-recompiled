@@ -4,7 +4,8 @@ What the PAL release (GLMP01, rev 0) changes in the Hidden Mansion compared to t
 (GLME01, rev 0), where each change lives, and how the port brings it to the US-based build.
 Everything below was found with `tools/pal_diff.py` against the user's own dumps; the commands
 to reproduce each finding are given inline. Addresses are virtual (0x80......); "US" is GLME01,
-"PAL" is GLMP01_00.
+"PAL" is GLMP01_00. The Japanese release, the normal-mansion differences of all three and the
+planned per-version lab menu: docs/VERSION_DIFFERENCES.md.
 
 ## Tools
 
