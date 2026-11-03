@@ -76,6 +76,16 @@ bool overlayUpToDate(const Disc& us, const Disc& pal) {
     return readText(port::hiddenMansionOverlayDir() / "overlay.key") == overlayKey(us, pal);
 }
 
+// Per-version mansions (docs/VERSION_DIFFERENCES.md): <overlay>/versions, for 2+ discs.
+constexpr const char* kVersionsFormat = "versions-overlay 1";
+std::string versionsKey(const std::vector<const Disc*>& discs) {
+    std::string text = kVersionsFormat;
+    for (const Disc* d : discs) text += std::string("\n") + port::gameId(d->version()) + " " + d->dolSha1();
+    const auto d = port::dol::sha1(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    return hex(d.data(), d.size());
+}
+std::filesystem::path versionsDir() { return port::hiddenMansionOverlayDir() / "versions"; }
+
 void validate(Slot& s, GameVersion expected) {
     s.valid = false;
     s.message.clear();
@@ -101,7 +111,8 @@ void validate(Slot& s, GameVersion expected) {
 struct Plan {
     std::vector<GameVersion> modules;  // modules to (re)build
     bool overlay = false;               // PAL Hidden Mansion overlay to (re)build
-    bool empty() const { return modules.empty() && !overlay; }
+    bool versions = false;              // per-version mansions overlay to (re)build (2+ discs)
+    bool empty() const { return modules.empty() && !overlay && !versions; }
 };
 
 Plan makePlan(const Slot slots[kSlots]) {
@@ -118,6 +129,11 @@ Plan makePlan(const Slot slots[kSlots]) {
         if (!moduleUpToDate(*discs[i])) p.modules.push_back(discs[i]->version());
     }
     if (discs[0] && discs[1] && !overlayUpToDate(*discs[0], *discs[1])) p.overlay = true;
+    std::vector<const Disc*> have;
+    for (const auto& d : discs)
+        if (d) have.push_back(d.get());
+    // (The Hidden Mansion overlay build replaces the whole folder, versions/ included.)
+    if (have.size() >= 2 && (p.overlay || readText(versionsDir() / "versions.key") != versionsKey(have))) p.versions = true;
     return p;
 }
 
@@ -135,7 +151,7 @@ void startJob(Job& job, const Slot slots[kSlots], const Plan& plan) {
             job.error = e;
             job.done = true;
         };
-        const float steps = float(plan.modules.size() + (plan.overlay ? 1 : 0));
+        const float steps = float(plan.modules.size() + (plan.overlay ? 1 : 0) + (plan.versions ? 1 : 0));
         float step = 0.0f;
         for (GameVersion v : plan.modules) {
             const int i = int(v);
@@ -158,6 +174,23 @@ void startJob(Job& job, const Slot slots[kSlots], const Plan& plan) {
             const auto dir = port::hiddenMansionOverlayDir();
             if (!buildHiddenMansionOverlay(us, pal, dir, err)) return fail(err);
             std::ofstream(port::longPath(dir / "overlay.key"), std::ios::binary) << overlayKey(us, pal);
+            step += 1.0f;
+        }
+        if (plan.versions) {
+            set("Building the per-version mansion data", step / steps);
+            std::vector<std::unique_ptr<Disc>> open;
+            std::vector<const Disc*> list;
+            for (const std::string& path : paths) {
+                if (path.empty()) continue;
+                auto d = std::make_unique<Disc>();
+                std::string err;
+                if (!d->open(path, err)) return fail(err);
+                list.push_back(d.get());
+                open.push_back(std::move(d));
+            }
+            std::string err;
+            if (!buildVersionsOverlay(list, versionsDir(), err)) return fail(err);
+            std::ofstream(port::longPath(versionsDir() / "versions.key"), std::ios::binary) << versionsKey(list);
         }
         std::lock_guard lk(job.m);
         job.stage = "Done";

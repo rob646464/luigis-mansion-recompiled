@@ -214,6 +214,8 @@ std::vector<Field> fields() {
         flag("enhancements", "show_fps", e.showFps),
         flag("enhancements", "pause_on_focus_loss", e.pauseOnFocusLoss),
         flag("enhancements", "hidden_mansion_pal", e.hiddenMansionPal),
+        num("enhancements", "hidden_mansion_jp", e.hiddenMansionJp),
+        num("enhancements", "mansion_version", e.mansionVersion),
         num("enhancements", "pal_language", e.palLanguage),
         flag("enhancements", "gbh_camera", e.gbhCamera),
         flag("enhancements", "gbh_tracker", e.gbhTracker),

@@ -12,7 +12,8 @@
 # must use VA()/VOFF() for addresses and offsets (src/recomp/version.h). See docs/SETUP.md.
 # Not tagged `jp` (docs/SETUP.md "The Japanese game"): the HVQM movie hooks and fn_8005582C
 # (not in the Japanese game), the European Hidden Mansion tuning hooks the Japanese game changed
-# (fn_800B41E0, fn_8009FD54, fn_800E70BC, fn_800E7698), and every USA-only line.
+# (fn_800B41E0, fn_8009FD54), and every USA-only line. (The heart hooks fn_800E70BC/fn_800E7698 are
+# tagged: their handlers only correct the result to another release's threshold.)
 
 # JAudio's DSP driver: the audio DSP is not emulated. Its boot handshake is skipped
 # and its command mailbox / halt release drive our microcode stand-in
@@ -68,8 +69,8 @@ fn_8001333C us pal jp
 
 # PAL Hidden Mansion tuning (src/recomp/hidden_mansion_hooks.cpp, docs/HIDDEN_MANSION.md):
 # each wraps the original and only changes behaviour while the PAL rules are active.
-fn_800E70BC us pal
-fn_800E7698 us pal
+fn_800E70BC us pal jp
+fn_800E7698 us pal jp
 fn_8009FD54 us pal
 fn_8009FCA8 us pal jp
 fn_8006D1B8 us pal jp
@@ -197,7 +198,7 @@ fn_800A09D0 pal
 fn_800A1BCC pal
 fn_8018865C pal
 fn_80189054 pal
-fn_800B9680 pal
+fn_800B9680 us pal
 fn_8003DF88 pal
 fn_800DBE8C pal
 fn_800B84E4 pal
@@ -386,3 +387,15 @@ fn_800CD1F4 us pal jp
 fn_801589A8 us pal jp
 fn_80151CC8 us pal jp
 fn_80059710 us pal jp
+
+# Per-version mansions (hidden_mansion.cpp syncConstants, docs/VERSION_DIFFERENCES.md): Chauncey's
+# approach state fn_8009FD54 stops at the distance its two later loads give (USA 15f, Japan 10f,
+# PAL normal 20f): those loads re-pointed at the 10f / 20f / 15f literal (r2-relative).
+patch 61 8009FFC8 C002999C
+patch 61 8009FFF4 C002999C
+patch 62 8009FFC8 C00299B4
+patch 62 8009FFF4 C00299B4
+patch 62 8009EB40 C002999C jp
+patch 62 8009EB6C C002999C jp
+patch 63 8009EB40 C00299A8 jp
+patch 63 8009EB6C C00299A8 jp

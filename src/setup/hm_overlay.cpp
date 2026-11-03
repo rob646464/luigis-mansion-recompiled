@@ -315,6 +315,187 @@ bool writeFile(const std::filesystem::path& p, const Bytes& b) {
     return bool(o);
 }
 
+// ---- Per-version lab menu (docs/VERSION_DIFFERENCES.md "Lab menu design") ---------------
+using port::GameVersion;
+constexpr int kVersionFlagA = 60, kVersionFlagB = 76;  // recomp/hidden_mansion.h
+constexpr size_t kLabMansionLine = 3;                  // "The Mansion" / やしきにいく
+
+// Rules files of a release (served from versions/<ID>/ for another release's mansion).
+constexpr const char* kVersionFiles[] = {"/Map/map2.szp", "/Map/map4.szp", "/Iwamoto/map2/room_70.arc",
+                                         "/Iwamoto/map2/room_08.arc", "/model/kopabody.szp"};
+
+struct LabChoice {
+    GameVersion v;
+    size_t message;  // index of its line in every message table
+};
+
+// " (USA)" / " (Japan)" / " (PAL)"; Japanese tables: full-width (ＵＳＡ) / (日本) / (ＰＡＬ).
+std::string versionSuffix(GameVersion v, bool japanese, bool english) {
+    if (japanese) {
+        if (v == GameVersion::USA) return "\x81\x69\x82\x74\x82\x72\x82\x60\x81\x6A";
+        if (v == GameVersion::JPN) return "\x81\x69\x93\xFA\x96\x7B\x81\x6A";
+        return "\x81\x69\x82\x6F\x82\x60\x82\x6B\x81\x6A";
+    }
+    if (v == GameVersion::USA) return " (USA)";
+    if (v == GameVersion::JPN) return english ? " (Japan)" : " (JPN)";
+    return " (PAL)";
+}
+
+// The lab's message table with the follow-up lines appended (padded to `n` entries first, so
+// the indices are the same in every language of the archive).
+Bytes versionLabTable(const Bytes& table, size_t n, bool japanese, bool english, const std::vector<LabChoice>& mansion,
+                      const std::vector<LabChoice>& hidden) {
+    auto e = tableEntries(table);
+    if (e.size() <= kLabHiddenLine || e.size() > n) throw std::runtime_error("unexpected lab message table");
+    auto line = [&](size_t i) {
+        Bytes b = e[i];
+        while (!b.empty() && (b.back() == '.' || b.back() == ' ')) b.pop_back();
+        return b;
+    };
+    const Bytes mansionLine = line(kLabMansionLine), hiddenLine = line(kLabHiddenLine);
+    e.resize(n);
+    for (const auto* list : {&mansion, &hidden})
+        for (const LabChoice& c : *list) {
+            Bytes l = list == &mansion ? mansionLine : hiddenLine;
+            const std::string s = versionSuffix(c.v, japanese, english);
+            l.insert(l.end(), s.begin(), s.end());
+            if (e.size() != c.message) throw std::runtime_error("lab message index mismatch");
+            e.push_back(l);
+        }
+    Bytes out = join(e, "\r\n");
+    const std::string tail = "\r\n\r\n";
+    out.insert(out.end(), tail.begin(), tail.end());
+    return out;
+}
+
+// The flag lines that record version v as the choice on base `base` ((60, 76), flag 8 = PAL Hidden).
+std::vector<Bytes> versionFlagLines(GameVersion v, GameVersion base, bool hidden) {
+    const bool own = v == base;
+    const bool a = !own && (v == GameVersion::USA || v == GameVersion::PAL);
+    const bool b = !own && (v == GameVersion::JPN || v == GameVersion::PAL);
+    auto flag = [](bool on, int n) { return bytes(std::string(on ? "<FLAGON>(" : "<FLAGOFF>(") + std::to_string(n) + ")"); };
+    std::vector<Bytes> out{flag(a, kVersionFlagA), flag(b, kVersionFlagB)};
+    if (hidden) out.push_back(flag(v == GameVersion::PAL, 8));
+    return out;
+}
+
+// One destination case ("back" = The Mansion, "urayasiki" = The Hidden Mansion) turned into a
+// follow-up choice; `marker` is the command the flags go before (<OMOTELUIGI> / <URALUIGI>).
+std::vector<Bytes> versionCase(const std::vector<Bytes>& lines, const std::string& caseName, const std::string& marker,
+                               const std::vector<LabChoice>& choices, GameVersion base, bool hidden) {
+    const auto start = std::find(lines.begin(), lines.end(), bytes("<CASE>\"" + caseName + "\""));
+    if (start == lines.end()) throw std::runtime_error("event08 has no \"" + caseName + "\" case");
+    const auto end = std::find_if(start + 1, lines.end(), [](const Bytes& l) { return startsWith(l, "<END>"); });
+    if (end == lines.end()) throw std::runtime_error("event08 \"" + caseName + "\" case has no end");
+    const std::vector<Bytes> body(start + 1, end + 1);
+    const auto at = std::find(body.begin(), body.end(), bytes(marker));
+    if (at == body.end()) throw std::runtime_error("event08 \"" + caseName + "\" case has no " + marker);
+    std::vector<Bytes> out(lines.begin(), start);
+    out.push_back(*start);
+    if (choices.size() > 1) {
+        std::string list = "<CHOICE>";
+        for (const LabChoice& c : choices)
+            list += "\"" + caseName + "_" + port::gameId(c.v) + "\"(" + std::to_string(c.message) + ")";
+        out.push_back(bytes(list + "<LISTEND>"));
+        out.push_back(bytes("<ANYKEY>"));
+    }
+    for (size_t i = 0; i < choices.size(); i++) {
+        if (choices.size() > 1) out.push_back(bytes("<CASE>\"" + caseName + "_" + port::gameId(choices[i].v) + "\""));
+        out.insert(out.end(), body.begin(), at);
+        const auto flags = versionFlagLines(choices[i].v, base, hidden);
+        out.insert(out.end(), flags.begin(), flags.end());
+        out.insert(out.end(), at, body.end());
+    }
+    out.insert(out.end(), end + 1, lines.end());
+    return out;
+}
+
+Bytes versionLabScript(const Bytes& script, GameVersion base, const std::vector<LabChoice>& mansion,
+                       const std::vector<LabChoice>& hidden) {
+    std::vector<Bytes> lines;
+    // The choice is cleared on entering the lab (as the European script clears flag 8), so a
+    // save made in the lab and every new visit start from the base's own version.
+    lines.push_back(bytes("<FLAGOFF>(8)"));
+    lines.push_back(bytes("<FLAGOFF>(" + std::to_string(kVersionFlagA) + ")"));
+    lines.push_back(bytes("<FLAGOFF>(" + std::to_string(kVersionFlagB) + ")"));
+    for (Bytes& l : split(script, "\r\n"))
+        if (!startsWith(l, "<FLAGON>(8)") && !startsWith(l, "<FLAGOFF>(8)")) lines.push_back(std::move(l));
+    lines = versionCase(lines, "back", "<OMOTELUIGI>", mansion, base, false);
+    lines = versionCase(lines, "urayasiki", "<URALUIGI>", hidden, base, true);
+    return join(lines, "\r\n");
+}
+
+}  // namespace
+
+bool buildVersionsOverlay(const std::vector<const Disc*>& discs, const std::filesystem::path& outDir, std::string& error) {
+    const std::filesystem::path out = port::longPath(outDir);
+    try {
+        std::error_code ec;
+        std::filesystem::remove_all(out, ec);
+        std::filesystem::create_directories(out);
+        auto have = [&](GameVersion v) {
+            return std::any_of(discs.begin(), discs.end(), [&](const Disc* d) { return d->version() == v; });
+        };
+        std::string manifest;
+        for (const Disc* d : discs) {
+            const auto dir = out / port::gameId(d->version());
+            for (const char* f : kVersionFiles) {
+                Bytes b;
+                if (!d->readFile(f, b)) throw std::runtime_error(std::string("the ") + port::regionName(d->version()) + " disc has no " + f);
+                const auto dst = dir / std::filesystem::path(f + 1);
+                std::filesystem::create_directories(dst.parent_path());
+                if (!writeFile(dst, b)) throw std::runtime_error("could not write the versions overlay");
+                manifest += std::string(port::gameId(d->version())) + " " + f + "\n";
+            }
+        }
+        for (const Disc* baseDisc : discs) {
+            const GameVersion base = baseDisc->version();
+            // The base's own version first (A twice = today's behaviour), then USA, Japan, PAL.
+            std::vector<GameVersion> order{base};
+            for (GameVersion v : {GameVersion::USA, GameVersion::JPN, GameVersion::PAL})
+                if (v != base && have(v)) order.push_back(v);
+            Bytes raw;
+            if (!baseDisc->readFile("/Event/event08.szp", raw)) throw std::runtime_error("missing /Event/event08.szp");
+            const Bytes arc = decompress(raw);
+            const auto files = rarcFiles(arc);
+            size_t n = 0;
+            for (const auto& [k, e] : files)
+                if (k.rfind("message/", 0) == 0) n = std::max(n, tableEntries(member(arc, e)).size());
+            std::vector<LabChoice> mansion, hidden;
+            size_t next = n;
+            for (GameVersion v : order) mansion.push_back({v, next++});
+            for (GameVersion v : order) {
+                // Hidden Mansions offered: the European one on the Japanese base is not done yet; the
+                // European one on the USA base and the USA one on the European base need both discs
+                // (the Hidden Mansion overlay), which holds whenever both are in `order`.
+                if (base == GameVersion::JPN && v == GameVersion::PAL) continue;
+                hidden.push_back({v, next++});
+            }
+            const auto script = files.find("text/event08.txt");
+            if (script == files.end()) throw std::runtime_error("event08 has no script");
+            Bytes lab = rarcReplace(arc, script->second, versionLabScript(member(arc, script->second), base, mansion, hidden));
+            for (const auto& [k, e] : files) {
+                if (k.rfind("message/", 0) != 0) continue;
+                const bool japanese = k.find("japanese") != std::string::npos || base == GameVersion::JPN;
+                const bool english = k.find("english") != std::string::npos || base == GameVersion::USA;
+                lab = rarcReplace(lab, rarcFiles(lab).at(k), versionLabTable(member(arc, e), n, japanese, english, mansion, hidden));
+            }
+            const auto check = rarcFiles(lab);
+            if (check.size() != files.size()) throw std::runtime_error("archive rewrite failed");
+            const auto dst = out / "lab" / port::gameId(base) / "Event";
+            std::filesystem::create_directories(dst);
+            if (!writeFile(dst / "event08.szp", yay0Store(lab))) throw std::runtime_error("could not write the versions overlay");
+            manifest += std::string("lab ") + port::gameId(base) + " /Event/event08.szp\n";
+        }
+        std::ofstream(out / "manifest.txt", std::ios::binary) << manifest;
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("Building the per-version mansion data failed: ") + e.what();
+        return false;
+    }
+}
+
+namespace {
 }  // namespace
 
 bool buildHiddenMansionOverlay(const Disc& us, const Disc& pal, const std::filesystem::path& outDir, std::string& error) {

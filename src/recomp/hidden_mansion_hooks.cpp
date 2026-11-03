@@ -78,52 +78,52 @@ u32 guestCall1(Ctx& c, u32 fn, u32 a0) {
 #define kCurMapNo VA(0x804D80C8)  // sCurMapNo
 
 constexpr u32 kHeartCounter = 0x6C8;  // player field compared by the heart-item logic
-constexpr s32 kUsHiddenThreshold = 400, kPalHiddenThreshold = 1000;
+
+
+
+// Heart items (docs/VERSION_DIFFERENCES.md "Hearts"): a small heart heals 20 instead of 10 once
+// the player's treasure counter reaches the threshold of the release whose rules apply (USA
+// 200 / Hidden 400, Japan 100, PAL 200 / Hidden 1000). The running game compares with its own
+// (base) threshold; where the two differ the result is corrected.
+int baseHeart(bool hidden) { return hm::rules(hm::baseVariant(), hidden).heartThreshold; }
+int wantHeart(bool hidden) { return hm::rules(hm::rulesVariant(), hidden).heartThreshold; }
+
+#define RULE_FIRST(...)                                     \
+    do {                                                    \
+        static bool sLogged = false;                        \
+        if (!sLogged) {                                     \
+            sLogged = true;                                 \
+            log("[rules] " __VA_ARGS__);                    \
+        }                                                   \
+    } while (0)
 
 }  // namespace
 
-// Heart-item check: true when the player's counter reaches the threshold
-// (normal 200, US hidden 400, PAL hidden 1000).
+// Heart-item check: true when the player's counter reaches the threshold.
 HLE(fn_800E70BC) {
     hm::callWithFlag(c, "fn_800E70BC");
-    if (hm::usaOnPalActive()) {  // European game, USA rules: 400 instead of the PAL 1000
-        const u32 p = player(c);
-        if (inMem1(p)) c.r[3] = u32(s32(rd32(p + kHeartCounter)) >= kUsHiddenThreshold);
-        HM_FIRST("(USA rules on the European game) fn_800E70BC heart threshold 400");
-    } else if (hm::palActive()) {
-        const u32 r3 = c.r[3];
-        const u32 p = player(c);
-        c.r[3] = inMem1(p) ? u32(s32(rd32(p + kHeartCounter)) >= kPalHiddenThreshold) : r3;
-        HM_FIRST("fn_800E70BC heart threshold 1000");
-    }
+    const bool hidden = hm::hiddenActive();
+    const int want = wantHeart(hidden), base = baseHeart(hidden);
+    if (want == base) return;
+    const u32 p = player(c);
+    if (inMem1(p)) c.r[3] = u32(s32(rd32(p + kHeartCounter)) >= want);
+    RULE_FIRST("fn_800E70BC heart threshold %d (%s rules; this game %d)", want, hm::variantName(hm::rulesVariant()), base);
 }
 
 // Item selection switch; one case picks between two items on the same threshold. That case
-// reads the counter once, so while PAL rules apply a value in [400, 1000) is presented as 399
-// for the duration of the call (PAL: below 1000 takes the "under" branch).
+// reads the counter once, so it is presented on the chosen rules' side of the game's own
+// threshold for the duration of the call.
 HLE(fn_800E7698) {
-    if (hm::usaOnPalActive()) {
-        // European game, USA rules: a counter in [400, 1000) is presented as 1000 for the call
-        // (the European game compares with 1000 in the hidden mansion, the USA game with 400).
-        const u32 p = player(c);
-        const s32 v = inMem1(p) ? s32(rd32(p + kHeartCounter)) : 0;
-        const bool adjust = v >= kUsHiddenThreshold && v < kPalHiddenThreshold;
-        if (adjust) wr32(p + kHeartCounter, u32(kPalHiddenThreshold));
-        hm::callWithFlag(c, "fn_800E7698");
-        if (adjust && rd32(p + kHeartCounter) == u32(kPalHiddenThreshold)) wr32(p + kHeartCounter, u32(v));
-        if (adjust) HM_FIRST("(USA rules on the European game) fn_800E7698 heart threshold 400");
-        return;
-    }
-    if (!hm::palActive()) return hm::callWithFlag(c, "fn_800E7698");
-    const u32 p = player(c);
-    const s32 v = inMem1(p) ? s32(rd32(p + kHeartCounter)) : 0;
-    const bool adjust = v >= kUsHiddenThreshold && v < kPalHiddenThreshold;
-    if (adjust) {
-        wr32(p + kHeartCounter, u32(kUsHiddenThreshold - 1));
-        HM_FIRST("fn_800E7698 heart threshold 1000");
-    }
-    callOriginal(c, "fn_800E7698");
-    if (adjust && rd32(p + kHeartCounter) == u32(kUsHiddenThreshold - 1)) wr32(p + kHeartCounter, u32(v));
+    const bool hidden = hm::hiddenActive();
+    const int want = wantHeart(hidden), base = baseHeart(hidden);
+    const u32 p = want != base ? player(c) : 0;
+    if (!inMem1(p)) return hm::callWithFlag(c, "fn_800E7698");
+    const s32 v = s32(rd32(p + kHeartCounter));
+    const s32 shown = v >= want ? std::max(v, s32(base)) : std::min(v, s32(base - 1));
+    if (shown != v) wr32(p + kHeartCounter, u32(shown));
+    hm::callWithFlag(c, "fn_800E7698");
+    if (shown != v && rd32(p + kHeartCounter) == u32(shown)) wr32(p + kHeartCounter, u32(v));
+    if (shown != v) RULE_FIRST("fn_800E7698 heart threshold %d (%s rules; this game %d)", want, hm::variantName(hm::rulesVariant()), base);
 }
 
 // Chauncey (KtEnBaby) approach state: PAL hidden uses 40 for both the distance test (US 15,
@@ -387,6 +387,12 @@ HLE(fn_800A926C) {  // bomb: enter "thrown" state
     callOriginal(c, "fn_800A926C");
     if (!hm::palActive()) {
         sFastBombs.erase(self);
+        // The European normal mansion's rules (docs/VERSION_DIFFERENCES.md 3): its thrown-bomb
+        // state sets +0x1D4 = 90 too (the USA game leaves it).
+        if (hm::rules(hm::rulesVariant(), hm::hiddenActive()).bowserBomb90) {
+            wrf(self + 0x1D4, 90.0f);
+            RULE_FIRST("fn_800A926C Bowser bomb +0x1D4 = 90 (PAL rules)");
+        }
         return;
     }
     if (sFastBombs.erase(self)) {
@@ -420,7 +426,15 @@ HM_HIDE(fn_800A1BCC)
 // screen (fn_8003DF88), fn_800DBE8C (x0.5); the heart and vacuum hooks do the same.
 #define HM_SHOW(name) \
     HLE(name) { hm::callWithFlag(c, #name); }
-HM_SHOW(fn_800B9680)
+// Luigi takes damage: x2 while the hidden-mansion flag is set (USA and PAL). The Japanese Hidden
+// Mansion rules on those games: no doubling (the flag reads 0 for the call).
+HLE(fn_800B9680) {
+    if (hm::hiddenActive() && !hm::rules(hm::rulesVariant(), true).doubleDamage) {
+        RULE_FIRST("fn_800B9680 no damage x2 (%s Hidden Mansion rules)", hm::variantName(hm::rulesVariant()));
+        return hm::callWithFlagAs(c, "fn_800B9680", false);
+    }
+    hm::callWithFlag(c, "fn_800B9680");
+}
 HM_SHOW(fn_8003DF88)
 HM_SHOW(fn_800DBE8C)
 

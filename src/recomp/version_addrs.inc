@@ -41,6 +41,7 @@
     {0x80188D04u, 0x8018C1B0u},  // start of fn_80188D04
     {0x8018D6C0u, 0x80190C5Cu},  // start of fn_8018D6C0
     {0x8019E620u, 0x801A1BE0u},  // start of DVDT_UnPause__Fv
+    {0x8020BE18u, 0x80210ED0u},  // lbl_8020BE00+0x18: 1 matching reference(s)
     {0x8021DB68u, 0x80222CA0u},  // pointed at by sSceneTable+0x8 (sSceneTable+0x8 (object moved by +0x50c8))
     {0x8021DBD8u, 0x80222D10u},  // pointed at by sSceneTable+0x10 (sSceneTable+0x10 (object moved by +0x50c8))
     {0x802FF218u, 0x80304340u},  // lbl_802FF218: 2 matching reference(s)

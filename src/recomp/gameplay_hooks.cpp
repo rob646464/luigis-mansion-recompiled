@@ -130,6 +130,15 @@ HLE(fn_800B9488) {
     static const u32 sMsg = guestSymbol("fn_800AEEA8");
     const bool scripted = c.lr >= sMsg && c.lr < sMsg + VOFF3(0x2884, 0x2884, 0x26AC);  // size of fn_800AEEA8
     if (scripted) return callOriginal(c, "fn_800B9488");
+    // The Japanese game has no damage x2 (its damage sites call this directly): the USA Hidden
+    // Mansion rules on the Japanese base double the hit here (docs/VERSION_DIFFERENCES.md).
+    if (ver::jpn() && hm::hiddenActive() && hm::rules(hm::rulesVariant(), true).doubleDamage) {
+        const s32 cur = rds16(c.r[3] + 0xFC), next = s16(c.r[4]);
+        if (next < cur) {
+            c.r[4] = u32(s32(cur - 2 * (cur - next))) & 0xFFFF;
+            GP_FIRST("(%s Hidden Mansion rules on the Japanese game) damage x2", hm::variantName(hm::rulesVariant()));
+        }
+    }
     const float k = current().damageScale;
     if (k != 1.0f) {
         const u32 luigi = c.r[3];
