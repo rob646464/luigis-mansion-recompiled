@@ -6,11 +6,12 @@
 name: Build
 
 on:
+  # Only releases and manual runs (Actions minutes are limited on the private repo; macOS
+  # runners count 10x, Windows 2x): pushes to main no longer build. tools/release_windows.ps1
+  # starts a run itself when the release commit has none (workflow_dispatch).
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
-  workflow_dispatch:  # other branches: gh workflow run build.yml --ref <branch>
+  workflow_dispatch:  # gh workflow run build.yml --ref <branch>
 
 # Read-only token: the jobs only check out the code and upload artifacts.
 permissions:
