@@ -84,7 +84,7 @@ std::vector<Field> fields() {
         flag("video", "vsync", v.vsync),
         num("video", "msaa", v.msaa),
         flag("video", "hud_keep_4x3", v.hudKeep4x3),
-        flag("video", "pal60", v.pal60),
+        flag("video", "pal_60hz", v.pal60),  // was "pal60" (default 50 Hz) before 1.1.7: ignored
         num("video", "vrr", v.vrr),
         flag("rendering", "integer_tev", r.integerTev),
         flag("rendering", "efb_color_depth", r.efbColorDepth),

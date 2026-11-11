@@ -1586,8 +1586,8 @@ void visualsTab() {
             v.pal60 = hz == 1;
             sDirty = true;
         }
-        ImGui::SetItemTooltip("European game only: the console's video timing, 50 Hz PAL or 60 Hz PAL60. The game\n"
-                              "paces itself with a timer, so its speed is the same either way.");
+        ImGui::SetItemTooltip("European game only: the console's video timing, 60 Hz PAL60 (default) or 50 Hz PAL.\n"
+                              "The game paces itself with a timer, so its speed is the same either way.");
     }
 
     ImGui::SeparatorText("CRT filter");

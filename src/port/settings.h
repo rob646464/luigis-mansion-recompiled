@@ -30,7 +30,10 @@ struct VideoSettings {
     bool vsync = true;          // applied at next launch
     int msaa = 1;               // 1, 2, 4, 8; applied at next launch
     bool hudKeep4x3 = true;     // keep 2D/HUD at 4:3 (centered) in widescreen
-    bool pal60 = false;         // PAL game only: 59.94 Hz retrace (PAL60) instead of 50 Hz (game speed unchanged)
+    // PAL game only: 59.94 Hz retrace (PAL60) instead of 50 Hz (game speed unchanged). Default 60 Hz
+    // since 1.1.7 (user decision 2026-11-11, same as the SMS port); the key was renamed from `pal60`
+    // so every older file gets the new default once.
+    bool pal60 = true;
     // Interpolated presentation on a variable refresh rate display (G-SYNC / FreeSync): 0 auto
     // (detected from the display's refresh timing), 1 on, 2 off (frame.cpp, docs/INTERPOLATION.md).
     int vrr = 0;

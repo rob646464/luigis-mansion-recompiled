@@ -480,8 +480,9 @@ Differences the runtime handles for the European game:
   known game path hits these cases (the pacer's delays are constant and positive; the SI and
   periodic alarms are unused with the PAD HLE'd). Test aid `LM_ALARM_TEST_PAST=<n>[,<ms>]`: the
   first n alarms are set ms (default 100) in the past; the alarm log marks them `past`.
-- **50 / 60 Hz.** F1 > Visuals > *PAL refresh rate*: 50 Hz (default, the console's PAL
-  video timing) or 60 Hz (PAL60). Because the European game times its frames with the
+- **50 / 60 Hz.** F1 > Visuals > *PAL refresh rate*: 60 Hz (PAL60, default since 1.1.7; the
+  settings key is `[video] pal_60hz`, the older `pal60` key is ignored so every file gets the new
+  default once) or 50 Hz (the console's PAL video timing). Because the European game times its frames with the
   alarm, the logic speed is the same either way (30 fps, like the USA game); the setting
   changes the VI retrace (`VIGetTvFormat`, retrace callbacks, `VIWaitForRetrace`).
 - **Language.** The game asks `OSGetLanguage` when its save has no language yet; F1 >
