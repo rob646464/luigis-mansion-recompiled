@@ -1,0 +1,14 @@
+diff --git a/lib/dolphin/card.cpp b/lib/dolphin/card.cpp
+--- a/lib/dolphin/card.cpp
++++ b/lib/dolphin/card.cpp
+@@ -21,7 +21,9 @@
+ constexpr uint16_t CARD_SECTOR_SIZE = 8192;
+ 
+ const char* get_card_region(const char* gameName) {
+-  if (gameName == nullptr || std::strlen(gameName) != 4) {
++  // sms-0362: the disc's game code is often a 4-char field without a terminator (g_gameName[4],
++  // CARDSetBasePath): only its first four characters count.
++  if (gameName == nullptr || strnlen(gameName, 4) != 4) {
+     return nullptr;
+   }
+   switch (gameName[3]) {

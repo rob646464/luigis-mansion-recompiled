@@ -1,0 +1,18 @@
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1993,7 +1993,13 @@
+         // sloped line is thinner than its width measured across it.
+         "\n    let perp_px = select(vec2f(sign(perp_dir.x), 0.0), vec2f(0.0, sign(perp_dir.y)),"
+         " abs(delta_px.x) >= abs(delta_px.y));"
+-        "\n    let line_width = ubuf.line_width * min(viewport_scale.x, viewport_scale.y);"
++        // The width is in EFB pixels along the widened axis: a mostly horizontal line grows by the
++        // vertical scale (EFB rows -> render rows). min(x, y) made such lines thinner than their
++        // spacing when the frame is scaled unevenly (640x448 shown at 4:3: 2.25 x 2.41 render
++        // pixels per EFB pixel), so stacked one-row lines (SMS's "TOO BAD!" wipe) left a gap every
++        // few rows (sms-0363). Mostly vertical lines keep min(x, y).
++        "\n    let line_width = ubuf.line_width * select(min(viewport_scale.x, viewport_scale.y), viewport_scale.y,"
++        " abs(delta_px.x) >= abs(delta_px.y));"
+         "\n    let offset_px = perp_px * (line_width / 2.0) * select(-1.0, 1.0, (vidx & 1u) != 0u);"
+         "\n    let offset_ndc = (offset_px * 2.0) / ubuf.render_viewport_size;"
+         "\n    let clip_base = select(clip_a, clip_b, use_b);"
