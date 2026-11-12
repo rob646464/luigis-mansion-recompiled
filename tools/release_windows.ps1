@@ -269,6 +269,9 @@ try {
     if ($notes.Contains("{{MAC_NOTE}}")) { $notes = $notes.Replace("{{MAC_NOTE}}", $macNote) }
     else { $linuxNote = $linuxNote + $macNote }
     $notes = $notes.Replace("{{DOWNLOAD_ROWS}}", ($rows -join "`n")).Replace("{{LINUX_NOTE}}", $linuxNote)
+    # Every release page starts with the Discord link (user request 2026-11-12).
+    $discord = "**Discord:** news, help and bug reports for all my projects: https://discord.gg/cM4chZtgh7"
+    if (-not $notes.Contains("discord.gg/")) { $notes = $discord + "`n`n" + $notes }
     $notesFile = Join-Path $outDir "$tag-notes.md"
     [IO.File]::WriteAllText($notesFile, $notes, (New-Object Text.UTF8Encoding $false))
     $title = "Luigi's Mansion Recompiled $version"
