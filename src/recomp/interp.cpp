@@ -146,6 +146,87 @@ struct ShadowLight {
     M34 lv{}, kp{}, kr{};
 };
 
+// --- per-tape host state (recycled) ---------------------------------------------
+// pairTapes gives each tape one array per kind it follows across game frames (the world* fields and
+// vertStep below), one entry per patch. Two tapes cannot share a block: replayPair reads a's entries
+// while it writes b's, and the queue can replay an older pair than the newest (sQueue). A block comes
+// back to this pool when its tape is destroyed. Seven arrays per tape per game frame were 18 malloc +
+// 39 free in endTape.
+struct FreeArray {
+    void* data = nullptr;
+    u32 capacity = 0;  // elements
+    u32 element = 0;   // bytes per element (4: atomic<f32>, 1: atomic<u8>)
+};
+constexpr u64 kFreeArrayBytes = 32u << 20;  // the live tapes' worth, not one huge frame's
+std::vector<FreeArray> sFreeArrays;
+u64 sFreeArrayBytes = 0;
+std::mutex sFreeArraysM;
+
+template <class T>
+std::atomic<T>* takeArray(size_t want, u32& capacity) {
+    capacity = u32(want);
+    if (want == 0) return nullptr;
+    {
+        std::lock_guard lk(sFreeArraysM);
+        size_t best = sFreeArrays.size();
+        for (size_t i = 0; i < sFreeArrays.size(); i++)
+            if (sFreeArrays[i].element == sizeof(T) && sFreeArrays[i].capacity >= want &&
+                (best == sFreeArrays.size() || sFreeArrays[i].capacity < sFreeArrays[best].capacity))
+                best = i;
+        if (best != sFreeArrays.size()) {
+            auto* p = static_cast<std::atomic<T>*>(sFreeArrays[best].data);
+            capacity = sFreeArrays[best].capacity;
+            sFreeArrayBytes -= u64(capacity) * sizeof(T);
+            sFreeArrays[best] = sFreeArrays.back();
+            sFreeArrays.pop_back();
+            return p;
+        }
+    }
+    return new std::atomic<T>[want];
+}
+
+template <class T>
+void freeArray(std::atomic<T>* p, u32 capacity) {
+    if (!p) return;
+    const u64 bytes = u64(capacity) * sizeof(T);
+    std::lock_guard lk(sFreeArraysM);
+    // Drop the smallest block of this kind first: a block too small for the room the game draws can
+    // never serve again, and the pool has to keep room for the ones that can.
+    while (sFreeArrayBytes + bytes > kFreeArrayBytes) {
+        size_t smallest = sFreeArrays.size();
+        for (size_t i = 0; i < sFreeArrays.size(); i++)
+            if (sFreeArrays[i].element == sizeof(T) &&
+                (smallest == sFreeArrays.size() || sFreeArrays[i].capacity < sFreeArrays[smallest].capacity))
+                smallest = i;
+        if (smallest == sFreeArrays.size()) break;
+        sFreeArrayBytes -= u64(sFreeArrays[smallest].capacity) * sizeof(T);
+        delete[] static_cast<std::atomic<T>*>(sFreeArrays[smallest].data);
+        sFreeArrays[smallest] = sFreeArrays.back();
+        sFreeArrays.pop_back();
+    }
+    if (sFreeArrayBytes + bytes > kFreeArrayBytes) {
+        delete[] p;
+        return;
+    }
+    sFreeArrays.push_back({p, capacity, u32(sizeof(T))});
+    sFreeArrayBytes += bytes;
+}
+
+// A tape's per-patch array: taken from the pool above, handed back when the tape is destroyed.
+template <class T>
+struct PooledDelete {
+    u32 capacity = 0;
+    void operator()(std::atomic<T>* p) const { freeArray(p, capacity); }
+};
+template <class T>
+using Pooled = std::unique_ptr<std::atomic<T>[], PooledDelete<T>>;
+template <class T>
+void setPooled(Pooled<T>& slot, u32 n) {
+    u32 capacity = 0;
+    std::atomic<T>* p = takeArray<T>(n, capacity);
+    slot = Pooled<T>(p, PooledDelete<T>{capacity});
+}
+
 struct Tape {
     std::vector<u8> bytes;
     // (tape offset, guest lr) of every GX call in it: names the caller of a malformed command
@@ -184,19 +265,19 @@ struct Tape {
     std::vector<u8> multiMember;
     // Per patch (host, set by the replays from pairedWith): how far the model matrix moved in world
     // space since pairedWith (-1: not known). A pair that keeps moving fast is motion, not a jump.
-    std::unique_ptr<std::atomic<float>[]> worldStep;
+    Pooled<float> worldStep;
     // Per patch (host, likewise): how far its world rotation turned since pairedWith, in degrees (-1:
     // not known), about which axis, and for how many more game frames it counts as tumbling (noteTurn).
-    std::unique_ptr<std::atomic<float>[]> worldTurn;
-    std::unique_ptr<std::atomic<float>[]> worldAxis;  // x, y, z per patch
-    std::unique_ptr<std::atomic<u8>[]> worldTumble;
-    std::unique_ptr<std::atomic<u8>[]> worldErratic;  // game frames left of erratic-step evidence (instance pass)
+    Pooled<float> worldTurn;
+    Pooled<float> worldAxis;  // x, y, z per patch
+    Pooled<u8> worldTumble;
+    Pooled<u8> worldErratic;  // game frames left of erratic-step evidence (instance pass)
     // Per patch (host, set by each replay from pairedWith): 1 when its model instance has a matrix
     // that cannot blend, so the whole instance is shown as b (the detector judges it as a switch).
-    std::unique_ptr<std::atomic<u8>[]> groupSnap;
+    Pooled<u8> groupSnap;
     // Per CPU-built block (host, set by the replays from pairedWith): how its centre moved since
     // pairedWith (x, y, z; NaN: not known). A block that turns back is another particle in that slot.
-    std::unique_ptr<std::atomic<float>[]> vertStep;
+    Pooled<float> vertStep;
     // Per texture matrix (guest, at pairing; texWrapPairs): each row's offset step since pairedWith
     // as blended (NaN: unknown), the whole textures a wrap skipped per row, and the decision
     // (0 the old rules, 1 a scroll blended by its step less texShift, 2 placed anew: b).
@@ -236,6 +317,48 @@ u32 usSince(std::chrono::steady_clock::time_point& t) {
     t = now;
     return us;
 }
+
+// A key -> value table whose entries live for one game frame (occurrence counters, pairTapes' key
+// indexes): an entry carries the generation it was written in, so a new tape bumps the generation
+// instead of clearing and rehashing (those clears took 96 + 60 + 43 guest-thread samples). Only
+// tables probed by key, never iterated, are stamped; stale keys go once the table holds a few tapes.
+template <class V>
+class GenTable {
+public:
+    struct Found {
+        V& val;
+        bool fresh;  // just created: V{}
+    };
+    Found entry(u64 key) {
+        auto [it, added] = rows.try_emplace(key);
+        Entry& e = it->second;
+        if (!added && e.gen == gen) return {e.val, false};
+        e.gen = gen;
+        e.val = V{};
+        return {e.val, true};
+    }
+    const V* find(u64 key) const {
+        const auto it = rows.find(key);
+        return it != rows.end() && it->second.gen == gen ? &it->second.val : nullptr;
+    }
+    void reserve(size_t n) { rows.reserve(n); }
+    // The next game frame: everything written so far reads as absent.
+    void nextFrame(size_t cap) {
+        if (rows.size() > cap) rows.clear();
+        if (++gen == 0) {  // wrapped: 0 is the generation of a never-written entry
+            rows.clear();
+            gen = 1;
+        }
+    }
+
+private:
+    struct Entry {
+        u32 gen = 0;
+        V val{};
+    };
+    std::unordered_map<u64, Entry> rows;
+    u32 gen = 1;
+};
 
 // --- guest side (guest thread only) ---
 std::vector<u8> sScratch;
@@ -355,8 +478,8 @@ struct TagFrame {
 constexpr int kMaxTagDepth = 64;
 TagFrame sTagStack[kMaxTagDepth];
 int sTagDepth = 0;
-std::unordered_map<u64, u32> sTagOcc;   // per tape: scope base identity -> occurrences so far
-std::unordered_map<u64, u32> sValOcc;   // per tape: (scope, kind, site...) -> values noted so far
+GenTable<u32> sTagOcc;   // per tape: scope base identity -> occurrences so far
+GenTable<u32> sValOcc;   // per tape: (scope, kind, site...) -> values noted so far
 std::map<u32, u32> sGen;  // tagged object address -> generation (ordered: freed blocks are ranges)
 u32 sGenEpoch = 0;        // added to every generation; bumped when the table is reset
 std::vector<SiteTag> sSiteTags;
@@ -386,9 +509,9 @@ u64 scopeBase(u64 parent, TagCat cat, u32 obj, u32 type, u32 sub) {
     return mix(parent ^ mix(u64(cat) << 56 ^ u64(obj) << 20 ^ u64(type) * 0x9E3779B97F4A7C15ull) ^
                mix(u64(sub) << 32 ^ generationOf(obj)));
 }
-u32 occurrence(std::unordered_map<u64, u32>& m, u64 k) {
+u32 occurrence(GenTable<u32>& m, u64 k) {
     if (!sCapturing) return 0;
-    return m[k]++;
+    return m.entry(k).val++;
 }
 
 // The camera the game is drawing with now (see viewMatrixSource), as an index into sViews. A
@@ -825,16 +948,18 @@ void texWrapPairs(const Tape& a, Tape& b) {
 void pairTapes(const Tape& a, Tape& b) {
     auto tp = Clock::now();
     b.pairedWith = &a;
-    b.partner.assign(b.patches.size(), -1);
-    b.worldStep.reset(new std::atomic<float>[b.patches.size()]);
-    b.worldTurn.reset(new std::atomic<float>[b.patches.size()]);
-    b.worldAxis.reset(new std::atomic<float>[3 * b.patches.size()]);
-    b.worldTumble.reset(new std::atomic<u8>[b.patches.size()]);
-    b.worldErratic.reset(new std::atomic<u8>[b.patches.size()]);
-    b.groupSnap.reset(new std::atomic<u8>[b.patches.size()]);
-    b.vertStep.reset(new std::atomic<float>[3 * b.patches.size()]);
-    for (u32 i = 0; i < 3 * b.patches.size(); i++) b.vertStep[i].store(std::nanf(""), std::memory_order_relaxed);
-    for (u32 i = 0; i < b.patches.size(); i++) {
+    const u32 nPatches = u32(b.patches.size());
+    b.partner.assign(nPatches, -1);
+    setPooled(b.worldStep, nPatches);
+    setPooled(b.worldTurn, nPatches);
+    setPooled(b.worldAxis, 3 * nPatches);
+    setPooled(b.worldTumble, nPatches);
+    setPooled(b.worldErratic, nPatches);
+    setPooled(b.groupSnap, nPatches);
+    setPooled(b.vertStep, 3 * nPatches);
+    const float kUnknownStep = std::nanf("");  // once: nanf parses its tag on every call
+    for (u32 i = 0; i < 3 * nPatches; i++) b.vertStep[i].store(kUnknownStep, std::memory_order_relaxed);
+    for (u32 i = 0; i < nPatches; i++) {
         b.worldStep[i].store(-1.0f, std::memory_order_relaxed);
         b.worldTurn[i].store(-1.0f, std::memory_order_relaxed);
         b.worldTumble[i].store(0, std::memory_order_relaxed);
@@ -842,16 +967,18 @@ void pairTapes(const Tape& a, Tape& b) {
         for (int c = 0; c < 3; c++) b.worldAxis[3 * i + c].store(0.0f, std::memory_order_relaxed);
         b.groupSnap[i].store(0, std::memory_order_relaxed);
     }
-    static std::unordered_map<u64, s32> byKey;
-    byKey.clear();
+    // The pairing tables below outlive the tape: a key seen only in an older game frame reads as
+    // absent (GenTable), so none of them is cleared and rehashed per game frame.
+    static GenTable<s32> byKey;
+    byKey.nextFrame(4 * a.patches.size() + 4096);
     byKey.reserve(a.patches.size() * 2);
     for (u32 i = 0; i < a.patches.size(); i++)
         if (const u64 k = a.patches[i].key) {
-            auto [it, fresh] = byKey.try_emplace(k, s32(i));
-            if (!fresh) it->second = -2;  // the same identity twice: ambiguous, never paired
+            auto [v, fresh] = byKey.entry(k);
+            v = fresh ? s32(i) : -2;  // the same identity twice: ambiguous, never paired
         }
-    static std::unordered_set<u64> seenB;
-    seenB.clear();
+    static GenTable<u8> seenB;
+    seenB.nextFrame(4 * b.patches.size() + 4096);
     b.paired = b.unpaired = b.untagged = 0;
     for (u32 i = 0; i < b.patches.size(); i++) {
         const Patch& p = b.patches[i];
@@ -859,60 +986,62 @@ void pairTapes(const Tape& a, Tape& b) {
             b.untagged++;
             continue;
         }
-        if (!seenB.insert(p.key).second) {  // ambiguous in b too
+        if (!seenB.entry(p.key).fresh) {  // ambiguous in b too
             b.unpaired++;
             continue;
         }
-        const auto it = byKey.find(p.key);
-        if (it == byKey.end() || it->second < 0 || !compatible(a.patches[it->second], p)) {
+        const s32* j = byKey.find(p.key);
+        if (!j || *j < 0 || !compatible(a.patches[*j], p)) {
             b.unpaired++;
             continue;
         }
-        b.partner[i] = it->second;
+        b.partner[i] = *j;
         b.paired++;
     }
     texWrapPairs(a, b);
     {
-        static std::unordered_map<u64, u32> perGroup;
-        perGroup.clear();
+        static GenTable<u32> perGroup;
+        perGroup.nextFrame(4 * b.patches.size() + 4096);
         for (const Patch& p : b.patches)
-            if (p.group && p.kind == Kind::PosMtx && p.count == 12 && p.role == 0) perGroup[p.group]++;
+            if (p.group && p.kind == Kind::PosMtx && p.count == 12 && p.role == 0) perGroup.entry(p.group).val++;
         b.multiMember.assign(b.patches.size(), 0);
         for (u32 i = 0; i < b.patches.size(); i++) {
             const Patch& p = b.patches[i];
-            if (p.group && !p.tumble && p.kind == Kind::PosMtx && p.count == 12 && p.role == 0 && perGroup[p.group] >= 2) b.multiMember[i] = 1;
+            if (!p.group || p.tumble || p.kind != Kind::PosMtx || p.count != 12 || p.role != 0) continue;
+            const u32* members = perGroup.find(p.group);
+            if (members && *members >= 2) b.multiMember[i] = 1;
         }
     }
     // Cameras by key.
     b.viewToA.assign(b.views.size(), -1);
     {
-        static std::unordered_map<u64, s32> va;
-        va.clear();
+        static GenTable<s32> va;
+        va.nextFrame(4 * a.viewKeys.size() + 4096);
         for (u32 i = 0; i < a.viewKeys.size(); i++) {
-            auto [it, fresh] = va.try_emplace(a.viewKeys[i], s32(i));
-            if (!fresh) it->second = -2;
+            auto [v, fresh] = va.entry(a.viewKeys[i]);
+            v = fresh ? s32(i) : -2;
         }
         for (u32 i = 0; i < b.viewKeys.size(); i++)
-            if (const auto it = va.find(b.viewKeys[i]); it != va.end() && it->second >= 0) b.viewToA[i] = it->second;
+            if (const s32* v = va.find(b.viewKeys[i]); v && *v >= 0) b.viewToA[i] = *v;
     }
     // Tagged position arrays (CPU-deformed geometry): the same identity, size, stride and format.
     b.arrayPartner.assign(b.arrayRecs.size(), -1);
     {
-        static std::unordered_map<u64, s32> ra;
-        ra.clear();
+        static GenTable<s32> ra;
+        ra.nextFrame(4 * a.arrayRecs.size() + 4096);
         for (u32 i = 0; i < a.arrayRecs.size(); i++) {
-            auto [it, fresh] = ra.try_emplace(a.arrayRecs[i].key, s32(i));
-            if (!fresh) it->second = -2;
+            auto [v, fresh] = ra.entry(a.arrayRecs[i].key);
+            v = fresh ? s32(i) : -2;
         }
         for (u32 i = 0; i < b.arrayRecs.size(); i++) {
             const detail::ArrayRec& r = b.arrayRecs[i];
-            const auto it = ra.find(r.key);
-            if (it == ra.end() || it->second < 0) continue;
-            const detail::ArrayRec& q = a.arrayRecs[it->second];
+            const s32* v = ra.find(r.key);
+            if (!v || *v < 0) continue;
+            const detail::ArrayRec& q = a.arrayRecs[*v];
             if (q.stride != r.stride || q.cnt != r.cnt || q.type != r.type || q.frac != r.frac ||
                 a.arrays[q.snap].size() != b.arrays[r.snap].size())
                 continue;
-            b.arrayPartner[i] = it->second;
+            b.arrayPartner[i] = *v;
         }
         // LM_ARRAY_LOG=<file> (test aid): every tagged position array of each tape, its partner and how
         // far its positions moved (max over coordinates).
@@ -1542,6 +1671,29 @@ std::string describeStreamPos(u64 streamPos) {
 void beginTape() {
     if (sScratch.empty()) sScratch.resize(kCaptureSize);
     sBase = 0;
+    const size_t lastKeys = sLastTape ? sLastTape->patches.size() : 0;
+    // endTape moves the staging vectors into the tape, which leaves them with no capacity: without a
+    // hint every game frame grows them from nothing again (10+ reallocations for a few thousand
+    // patches). The previous tape's sizes are the best guess.
+    if (sLastTape) {
+        const Tape& last = *sLastTape;
+        sPatches.reserve(lastKeys);
+        sBundleIds.reserve(last.bundleIds.size());
+        sBundleKey.reserve(last.bundleKey.size());
+        sBundleRange.reserve(last.bundleRange.size());
+        sBundlePass.reserve(last.bundlePass.size());
+        sBundleCentre.reserve(last.bundleCentre.size());
+        sSlotCentres.reserve(last.slotCentres.size());
+        sBundleSlots.reserve(last.bundleSlots.size());
+        sViews.reserve(last.views.size());
+        sViewKeys.reserve(last.viewKeys.size());
+        sLights.reserve(last.lights.size());
+        sLightKeys.reserve(last.lightKeys.size());
+        sTextGroups.reserve(last.textGroups.size());
+        sTextViews.reserve(last.textViews.size());
+        sBackSteps.reserve(last.backSteps.size());
+        if (last.sites) sTapeSites.reserve(last.sites->size());
+    }
     sPatches.clear();
     sBundleIds.clear();
     sBundleKey.clear();
@@ -1561,8 +1713,10 @@ void beginTape() {
     sTextDepth = 0;
     std::fill(std::begin(sLastPosMtx), std::end(sLastPosMtx), -1);
     sLastProj = -1;
-    sTagOcc.clear();
-    sValOcc.clear();
+    // A new tape: every key belongs to another game frame, so the counters of the tape just captured
+    // read as absent (GenTable).
+    sTagOcc.nextFrame(4 * lastKeys + 4096);
+    sValOcc.nextFrame(4 * lastKeys + 4096);
     sVirtBase = 0;
     sSlotPatch.fill(-1);
     sBundleSlots.clear();
@@ -4248,12 +4402,44 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
         // stretched into long straight sticks (user clips, 0a5e5f2: tape 160 a 0.05 / 0.34, tape 165
         // a 0.67); switching the whole hose (2f69188) detached it from Luigi's hand.
         {
-            static std::unordered_set<u64> snapGroups, forceGroups, fastGroups, skinGroups, tearGroups;
-            tearGroups.clear();
-            snapGroups.clear();
-            forceGroups.clear();
-            fastGroups.clear();
-            skinGroups.clear();
+            // Per instance of this tape: its members, the jump vote and the five policies (snap /
+            // force / fast / skin / tear below). Kept across presents with a generation stamp like
+            // GenTable: clearing per present reallocated every member list and freed five sets' nodes
+            // (replayPair runs twice per game frame at 60 Hz). `live` is what this present touched.
+            struct GroupRec {
+                std::vector<u32> members;
+                u32 voters = 0, jumped = 0;
+                u32 gen = 0;
+                u8 snap = 0, force = 0, fast = 0, skin = 0, tear = 0;
+            };
+            static std::unordered_map<u64, GroupRec> groups;
+            static std::vector<u64> live;
+            static u32 gen = 0;
+            live.clear();
+            // Group keys are per-tape identities (TagFrame::group): nothing recurs across tapes, so
+            // the table is dropped once it holds a few tapes' worth instead of growing with them.
+            if (++gen == 0 || groups.size() > (1u << 13)) {  // (0 is the generation of a never-written entry)
+                groups.clear();
+                gen = 1;
+            }
+            const auto groupRec = [](u64 g) -> GroupRec& {
+                GroupRec& r = groups[g];
+                if (r.gen != gen) {
+                    r.gen = gen;
+                    r.members.clear();
+                    r.voters = r.jumped = 0;
+                    r.snap = r.force = r.fast = r.skin = r.tear = 0;
+                    live.push_back(g);
+                }
+                return r;
+            };
+            const auto findRec = [](u64 g) -> const GroupRec* {
+                const auto it = groups.find(g);
+                return it != groups.end() && it->second.gen == gen ? &it->second : nullptr;
+            };
+            // Same lookup without inserting: the loops below walk `live`, and groupRec() could rehash
+            // the table under them.
+            const auto findRecMut = [&findRec](u64 g) -> GroupRec* { return const_cast<GroupRec*>(findRec(g)); };
             // The members, their world matrices in a and b, and per instance the median place of its
             // members in b: a member far from all the others (more than 4x the instance's median
             // spread and 250 units) skins nothing visible of it and has no say (the nursery bears' one
@@ -4264,12 +4450,13 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 s32 j;
                 M34 wa, wb;
                 float dist;
+                float step;         // placeStep(wa, wb) about `centre`: the instance median and the
+                                    // member's own classification both need it
+                const f32* centre;  // drawCentre(b, patches[i]): pure in (b, patch)
                 f32 cb[3];  // where its geometry is in b (world; the slot's vertex centre, else the origin)
             };
             static std::vector<Member> members;
             members.clear();
-            static std::unordered_map<u64, std::vector<u32>> byGroup;
-            byGroup.clear();
             for (u32 i = 0; i < b.patches.size(); i++) {
                 const Patch& p = b.patches[i];
                 const s32 j = b.partner[i];
@@ -4282,29 +4469,30 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 f32 va[12], vb[12];
                 for (int k = 0; k < 12; k++) va[k] = val(*a, a->patches[j], k), vb[k] = val(b, p, k);
                 Member m{i, j};
+                m.centre = drawCentre(b, p);
                 compose(vp->ia.data(), va, m.wa.data());
                 compose(vp->ib.data(), vb, m.wb.data());
-                m.dist = viewDist(vb, drawCentre(b, p));
+                m.dist = viewDist(vb, m.centre);
                 {
-                    const f32* c = sScrewBlend ? drawCentre(b, p) : nullptr;
+                    const f32* c = sScrewBlend ? m.centre : nullptr;
                     for (int r = 0; r < 3; r++)
                         m.cb[r] = c ? m.wb[4 * r] * c[0] + m.wb[4 * r + 1] * c[1] + m.wb[4 * r + 2] * c[2] + m.wb[4 * r + 3] : m.wb[4 * r + 3];
                 }
-                byGroup[p.group].push_back(u32(members.size()));
+                groupRec(p.group).members.push_back(u32(members.size()));
                 members.push_back(m);
             }
             static std::vector<u8> outlier;
             outlier.assign(members.size(), 0);
             static std::vector<float> groupStep;  // per member: the median step of its instance's members
             groupStep.assign(members.size(), 1e9f);
-            for (auto& [g, idx] : byGroup) {
+            for (const u64 g : live) {
+                const std::vector<u32>& idx = findRec(g)->members;  // live: no insert while iterating
                 {
                     static std::vector<float> st;
                     st.clear();
                     for (const u32 m : idx) {
-                        const M34& x = members[m].wa;
-                        const M34& y = members[m].wb;
-                        st.push_back(placeStep(x.data(), y.data(), drawCentre(b, b.patches[members[m].i])));
+                        members[m].step = placeStep(members[m].wa.data(), members[m].wb.data(), members[m].centre);
+                        st.push_back(members[m].step);
                     }
                     std::nth_element(st.begin(), st.begin() + st.size() / 2, st.end());
                     if (idx.size() >= 4)
@@ -4322,18 +4510,16 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 ds.clear();
                 for (const u32 m : idx)
                     ds.push_back(std::hypot(members[m].cb[0] - med[0], members[m].cb[1] - med[1], members[m].cb[2] - med[2]));
-                std::vector<float> sorted = ds;
+                static std::vector<float> sorted;
+                sorted.assign(ds.begin(), ds.end());
                 std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
                 const float spread = sorted[sorted.size() / 2];
                 for (size_t k = 0; k < idx.size(); k++)
                     if (ds[k] > std::max(250.0f, 4.0f * spread)) outlier[idx[k]] = 1;
             }
-            // Per instance: (members whose place jumped, members that voted). A real jump of an
-            // instance (a respawn, a teleport) moves most of its members alike; one of 49 jumping is a
-            // stray matrix and switches nothing (Luigi's J3D instance: one member's first erratic step
-            // after a quiet spell switched all of Luigi, sweep B).
-            static std::unordered_map<u64, std::pair<u32, u32>> jumpVotes;
-            jumpVotes.clear();
+            // A real jump of an instance (a respawn, a teleport) moves most of its members alike; one
+            // of 49 jumping is a stray matrix and switches nothing (Luigi's J3D instance: one member's
+            // first erratic step after a quiet spell switched all of Luigi, sweep B).
             // Test aid LM_GROUP_LOG=<file>: per tape (its first in-between replay), every model instance of 4
             // or more paired members: members, outliers, erratic (now / held), voters, jumped, fast, skin,
             // sheared flips, members without partner, the members' source range, and the policy taken
@@ -4358,7 +4544,8 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
             static std::unordered_map<u64, GStat> gstat;
             gstat.clear();
             if (groupLog) {
-                for (auto& [g, idx] : byGroup) {
+                for (const u64 g : live) {
+                    const std::vector<u32>& idx = findRec(g)->members;
                     GStat& st = gstat[g];
                     st.members = u32(idx.size());
                     for (const u32 m : idx) {
@@ -4377,13 +4564,15 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 const u32 i = members[mi].i;
                 const s32 j = members[mi].j;
                 const Patch& p = b.patches[i];
+                GroupRec& rec = groupRec(p.group);  // (already live: the member loop above made it)
                 const M34& wa = members[mi].wa;
                 const M34& wb = members[mi].wb;
                 // (No flip or twist resolution here: done per matrix it breaks a skinned mesh, whose
                 // envelope matrices are weighted sums of its joints.)
                 const float prev = a->worldStep ? a->worldStep[j].load(std::memory_order_relaxed) : -1.0f;
                 const float dist = members[mi].dist;
-                const float step = placeStep(wa.data(), wb.data(), drawCentre(b, p));
+                const f32* const centre = members[mi].centre;
+                const float step = members[mi].step;
                 // (Recorded here too: a switched instance skips the per-matrix path that records it.)
                 if (b.worldStep && b.worldStep[i].load(std::memory_order_relaxed) < 0.0f)
                     b.worldStep[i].store(step, std::memory_order_relaxed);
@@ -4416,26 +4605,32 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                     // (A half turn of an erratic member tears its model all the same: below.)
                     if ((held > 0 || now) && sScrewBlend && i < b.multiMember.size() && b.multiMember[i] &&
                         turnDegrees(wa.data(), wb.data(), 4) > 170.0f)
-                        tearGroups.insert(p.group);
+                        rec.tear = 1;
                     if (held > 0 || now) continue;
                 }
-                const bool near = blendableWorld(wa.data(), wb.data(), dist, prev, prevTurn, p.tumble, drawCentre(b, p));
-                const bool anyDist = blendableWorld(wa.data(), wb.data(), 1e9f, -1.0f, prevTurn, p.tumble, drawCentre(b, p));
-                jumpVotes[p.group].second++;
+                const bool near = blendableWorld(wa.data(), wb.data(), dist, prev, prevTurn, p.tumble, centre);
+                // blendableWorld's limit is max(200, 0.5*dist, 2*prev + 60) against the second call's
+                // 5e8: while dist < 1e9 and 2*prev + 60 <= 5e8, "near" implies "any distance" and the
+                // second call would repeat the decompose and placeStep for nothing. (A NaN distance or
+                // a step past the bound makes the first limit exceed the second's: call it, as before.)
+                bool anyDist = true;
+                if (!near || !(dist < 1e9f) || 2.0f * prev + 60.0f > 5e8f)
+                    anyDist = blendableWorld(wa.data(), wb.data(), 1e9f, -1.0f, prevTurn, p.tumble, centre);
+                rec.voters++;
                 if (!near && anyDist) {  // only the place jumped
-                    if (sTrace && jumpVotes[p.group].first == 0)
+                    if (sTrace && rec.jumped == 0)
                         log("[interp] tape %llu: instance %016llX jump vote by key %016llX site %08X step %.0f prev %.0f dist %.0f median %.0f (%zu members)",
                             (unsigned long long)b.seq, (unsigned long long)p.group, (unsigned long long)p.key, p.site, step, prev, dist,
-                            groupStep[mi], byGroup.count(p.group) ? byGroup[p.group].size() : 0);
-                    jumpVotes[p.group].first++;
-                    if (sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) tearGroups.insert(p.group);
+                            groupStep[mi], rec.members.size());
+                    rec.jumped++;
+                    if (sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) rec.tear = 1;
                     continue;
                 }
                 // A member that cannot be blended rigidly at all (a mirror flip, a turn over ~150 degrees
                 // without spin evidence, a 16x scale) would be switched on its own while the rest of its
                 // model blends: the model tears for an interval (the suction swirl). The whole instance
                 // blends entrywise instead, unless it is switched as a whole (below).
-                if (!anyDist && sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) tearGroups.insert(p.group);
+                if (!anyDist && sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) rec.tear = 1;
                 const bool flat = flatMatrix(wa.data()) || flatMatrix(wb.data());
                 bool fast = !anyDist || flat, skin = flat;
                 Rigid ra, rb;
@@ -4447,14 +4642,14 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                     // A half turn (over ~170 degrees) has no knowable direction: a member of an articulated
                     // model blended the short way swept its geometry through either side of the model
                     // (the suction swirl, 400 units a game frame); the whole instance goes entrywise.
-                    if (d < 0.087f && sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) tearGroups.insert(p.group);
+                    if (d < 0.087f && sScrewBlend && i < b.multiMember.size() && b.multiMember[i]) rec.tear = 1;
                     // An envelope matrix whose axes change length by over 30% in one game frame (the weights of
                     // its joints moved: a hose envelope went from 0.94 to 0.43 along two axes) is no rigid
                     // motion: blended as a turn and a scale its vertices left their path by half their step.
                     if (sScrewBlend && i < b.multiMember.size() && b.multiMember[i])
                         for (int k = 0; k < 3; k++) {
                             const float la = std::hypot(wa[k], wa[4 + k], wa[8 + k]), lb = std::hypot(wb[k], wb[4 + k], wb[8 + k]);
-                            if (std::max(la, lb) > 1.3f * std::min(la, lb)) tearGroups.insert(p.group);
+                            if (std::max(la, lb) > 1.3f * std::min(la, lb)) rec.tear = 1;
                         }
                     // A weighted (envelope) matrix of joints that point different ways is sheared.
                     for (const Rigid* r : {&ra, &rb}) {
@@ -4471,8 +4666,8 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 const bool skew = skewFlip(wa.data(), wb.data()) || tumblerMirror(p, wa.data(), wb.data()) ||
                                   (sScrewBlend && i < b.multiMember.size() && b.multiMember[i] && (det3(wa.data()) < 0) != (det3(wb.data()) < 0));
                 if (skew) fast = skin = true;
-                if (fast) fastGroups.insert(p.group);
-                if (skin) skinGroups.insert(p.group);
+                if (fast) rec.fast = 1;
+                if (skin) rec.skin = 1;
                 if (groupLog) {
                     GStat& st = gstat[p.group];
                     st.fast += fast, st.skin += skin, st.skew += skew;
@@ -4487,49 +4682,53 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                         (unsigned long long)b.seq, (unsigned long long)p.group, (unsigned long long)p.key, int(near), int(anyDist), int(flat),
                         int(skew), int(fast), int(skin));
             }
-            for (const auto& [g, v] : jumpVotes)
-                if (v.first > 0 && (v.second < 4 || 2 * v.first >= v.second)) {
-                    snapGroups.insert(g);
+            for (const u64 g : live) {
+                GroupRec& r = *findRecMut(g);
+                if (r.jumped > 0 && (r.voters < 4 || 2 * r.jumped >= r.voters)) {
+                    r.snap = 1;
                     if (sTrace) log("[interp] tape %llu: instance %016llX switched (%u of %u members jumped)", (unsigned long long)b.seq,
-                                    (unsigned long long)g, v.first, v.second);
+                                    (unsigned long long)g, r.jumped, r.voters);
                 }
+            }
             // Own-camera model instances (see sOwnInstances): skinned ones blend entrywise as a whole.
             if (sOwnInstances)
                 for (u32 i = 0; i < b.patches.size(); i++) {
                     const Patch& p = b.patches[i];
                     const s32 j = b.partner[i];
-                    if (!p.ownCamera || !p.group || j < 0 || p.kind != Kind::PosMtx || p.count != 12 || p.role != 0 ||
-                        forceGroups.count(p.group))
-                        continue;
+                    if (!p.ownCamera || !p.group || j < 0 || p.kind != Kind::PosMtx || p.count != 12 || p.role != 0) continue;
+                    if (const GroupRec* r = findRec(p.group); r && r->force) continue;
                     f32 va[12], vb[12];
                     for (int e = 0; e < 12; e++) va[e] = val(*a, a->patches[j], e), vb[e] = val(b, p, e);
                     if (skinMatrix(va) || skinMatrix(vb)) {
-                        forceGroups.insert(p.group);
+                        groupRec(p.group).force = 1;
                         sOwnSkinned++;
                     }
                 }
             // Linear only for a skinned instance (some matrix sheared or flat) with a fast turn: rigid
             // parts (the water's bubbles, which spin) keep their own rigid blend (entrywise, a part
             // turning half a turn shrank to a sliver: the bubbles faded between game frames).
-            for (const u64 g : fastGroups)
-                if (skinGroups.count(g)) forceGroups.insert(g);
-            for (const u64 g : tearGroups)
-                if (!snapGroups.count(g)) forceGroups.insert(g);
+            u32 snaps = 0, forced = 0;
+            for (const u64 g : live) {
+                GroupRec& r = *findRecMut(g);
+                if ((r.fast && r.skin) || (r.tear && !r.snap)) r.force = 1;
+                snaps += r.snap, forced += r.force;
+            }
             for (u32 i = 0; i < b.patches.size(); i++) {
                 const u64 g = b.patches[i].group;
-                const u8 v = !g ? 0 : snapGroups.count(g) ? 1 : forceGroups.count(g) ? 2 : 0;
+                const GroupRec* r = g ? findRec(g) : nullptr;
+                const u8 v = !r ? 0 : r->snap ? 1 : r->force ? 2 : 0;
                 if (b.groupSnap) b.groupSnap[i].store(v, std::memory_order_relaxed);
             }
-            sGroupSnaps += u32(snapGroups.size());
-            sGroupForced += u32(forceGroups.size());
+            sGroupSnaps += snaps;
+            sGroupForced += forced;
             if (groupLog) {
                 for (const auto& [g, st] : gstat) {
                     if (st.members < 4) continue;
-                    const auto v = jumpVotes.count(g) ? jumpVotes[g] : std::pair<u32, u32>{0, 0};
+                    const GroupRec* r = findRec(g);
                     std::fprintf(sGroupLog, "G %llu f%u %016llX members %u outliers %u erratic %u held %u voters %u jumped %u fast %u turn90 %u skin %u skew %u unpaired %u src %08X-%08X policy %d\n",
                                  (unsigned long long)b.seq, b.dumpFrame ? b.dumpFrame : b.gameFrame, (unsigned long long)g, st.members, st.outliers,
-                                 st.erraticNow, st.erraticHeld, v.second, v.first, st.fast, st.turn90, st.skin, st.skew, st.unpaired, st.srcLo,
-                                 st.srcHi, snapGroups.count(g) ? 1 : forceGroups.count(g) ? 2 : 0);
+                                 st.erraticNow, st.erraticHeld, r ? r->voters : 0, r ? r->jumped : 0, st.fast, st.turn90, st.skin, st.skew, st.unpaired,
+                                 st.srcLo, st.srcHi, r && r->snap ? 1 : r && r->force ? 2 : 0);
                 }
                 std::fflush(sGroupLog);
             }
@@ -4767,6 +4966,10 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 continue;
             }
             bool ok;
+            // drawCentre is pure in (b, patch): a lower_bound over b.slotCentres, then the centre of
+            // the draw's vertices. The paths below ask for it up to four times per patch; ask once.
+            // Only position matrices use it.
+            const f32* const ctr = p.kind == Kind::PosMtx ? drawCentre(b, p) : nullptr;
             const ViewPair* pivotVp = nullptr;  // a spinner / tumbler: its drawn centre is moved in a straight line
             if (p.kind == Kind::PosMtx && p.count == 12 && p.role == 0 && p.view < sViewToA.size() && sViewToA[p.view] == s32(q.view)) {
                 const ViewPair* vp = viewPair(*a, q.view, b, p.view, alpha);
@@ -4792,15 +4995,15 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                         flipped = resolveFlip(wa.data(), wb.data(), 4);
                         untwisted = untwist(wa.data(), wb.data());
                     }
-                    const float step = placeStep(wa.data(), wb.data(), drawCentre(b, p));
+                    const float step = placeStep(wa.data(), wb.data(), ctr);
                     if (b.worldStep) b.worldStep[i].store(step, std::memory_order_relaxed);
                     const float prev = a->worldStep ? a->worldStep[j].load(std::memory_order_relaxed) : -1.0f;
-                    ok = forced || blendableWorld(wa.data(), wb.data(), viewDist(vb, drawCentre(b, p)), prev, prevTurn, p.tumble, drawCentre(b, p));
+                    ok = forced || blendableWorld(wa.data(), wb.data(), viewDist(vb, ctr), prev, prevTurn, p.tumble, ctr);
                     // A member of an articulated or skinned instance that was not switched as a whole and is not
                     // erratic moves with its instance: its place is not a jump (switched on its own it tore the
                     // model for an interval: the suction swirl swinging with the nozzle, 300 units a game frame).
                     if (!ok && sScrewBlend && member && groupPolicy == 0 && b.worldErratic && b.worldErratic[i].load(std::memory_order_relaxed) == 0)
-                        ok = blendableWorld(wa.data(), wb.data(), 1e9f, -1.0f, prevTurn, p.tumble, drawCentre(b, p));
+                        ok = blendableWorld(wa.data(), wb.data(), 1e9f, -1.0f, prevTurn, p.tumble, ctr);
                     if (excl) {
                         ExclStat& st = sExclStats[p.group];
                         st.n++, st.snapped += !ok, st.flipped += flipped && !forced, st.untwisted += untwisted && !forced;
@@ -4837,8 +5040,8 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 // (Measured where its geometry is, placeStep: the event scenes' models have their origin
                 // 4000-5600 units from their vertices, and a turn of a few degrees moved the origin by
                 // 1000-10000 units: switched while the model moved 50-900, path check.)
-                const float d = viewDist(vb, drawCentre(b, p));
-                const float j = placeStep(va, vb, drawCentre(b, p));
+                const float d = viewDist(vb, ctr);
+                const float j = placeStep(va, vb, ctr);
                 ok = blendable(p.kind, va, vb, p.count) && j <= std::max(20.0f, 0.1f * d);
             } else if (p.bundle < b.bundlePass.size() && b.bundlePass[p.bundle] == 1 && sLightPair.ok) {
                 // The shadow caster pass, while its light blends: everything in it blends with the
@@ -4872,12 +5075,11 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
             // scene. LM_OWNCAM_PIVOT=1: pivot anyway.)
             static const bool sOwnPivot = !sScrewBlend || std::getenv("LM_OWNCAM_PIVOT") != nullptr;
             if (sOwnInstances && sOwnPivot && p.ownCamera && p.kind == Kind::PosMtx && p.count == 12 && p.role == 0 && !forced &&
-                drawCentre(b, p)) {  // (the vertices of its own slot when known: hose-jump SlotCentres)
-                const f32* c = drawCentre(b, p);
+                ctr) {  // (the vertices of its own slot when known: hose-jump SlotCentres)
                 f32 pa[3], pb[3], have[3];
-                xform34(va, c, pa);
-                xform34(vb, c, pb);
-                xform34(out, c, have);
+                xform34(va, ctr, pa);
+                xform34(vb, ctr, pb);
+                xform34(out, ctr, have);
                 for (int r = 0; r < 3; r++) out[4 * r + 3] += pa[r] + (pb[r] - pa[r]) * alpha - have[r];
                 sOwnPivoted++;
             }
