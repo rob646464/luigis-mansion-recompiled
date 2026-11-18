@@ -178,16 +178,25 @@ bool sCasterSnap = false;
 // LM_SHADOW_SNAP: 3 (default) consistent blend: the caster pass factored by the light's camera and
 // the receivers' shadow matrices rebuilt from the same blended light (interp::noteShadowLight);
 // 1 snap (shadows at 30 Hz); 0 blend each matrix on its own (inconsistent); 2 linear caster pass.
-int shadowInterpMode() {
-    static const int v = [] { const char* e = std::getenv("LM_SHADOW_SNAP"); return e ? std::atoi(e) : 3; }();
-    return v;
-}
-bool shadowSnap() { return shadowInterpMode() == 1; }
+// shadowSnap() runs per receiver batch (fn_8005DCA0 / fn_8005DD50, per object that receives a
+// shadow), so the switch is read into sShadowInterp once.
+const int sShadowInterp = [] { const char* e = std::getenv("LM_SHADOW_SNAP"); return e ? std::atoi(e) : 3; }();
+int shadowInterpMode() { return sShadowInterp; }
+bool shadowSnap() { return sShadowInterp == 1; }
 
 // Set by fn_800293A8, the gameplay shadow light's parameter setup, which fn_8005EF84 calls right
 // before the pass (cutscene shadow passes, fn_80114144, use their own keyframed lights).
 bool sGameplayLight = false;
 bool sFlashlightLight = false;
+
+// Test aids: LM_NO_SHADOW=1 draws the frame without the game's shadows (strength 0, for isolating
+// them by difference), LM_ROOMS_LIT=1 makes rooms behave as lit, LM_SHADOW_LOG=<every> logs each
+// shadow setup (every 30 when set to 1).
+const bool sNoShadow = std::getenv("LM_NO_SHADOW") != nullptr;
+const bool sRoomsLit = std::getenv("LM_ROOMS_LIT") != nullptr;
+const bool sShadowLog = std::getenv("LM_SHADOW_LOG") != nullptr;
+const int sShadowLogEvery =
+    [] { const char* e = std::getenv("LM_SHADOW_LOG"); return e ? std::max(1, std::atoi(e) == 1 ? 30 : 1) : 30; }();
 
 }  // namespace
 
@@ -196,8 +205,7 @@ bool sFlashlightLight = false;
 // (lbl_803A3CA0 +0x24) has its dark flag +0xAC set and mode +0x94 == 5; the flag is cleared for
 // the call, so the room shadow light (the one that follows Luigi) is used.
 HLE(fn_80029050) {
-    static const bool sLit = std::getenv("LM_ROOMS_LIT") != nullptr;
-    const u32 obj = sLit ? rd32(VA(0x803A3CA0) + 0x24) : 0;
+    const u32 obj = sRoomsLit ? rd32(VA(0x803A3CA0) + 0x24) : 0;
     if ((obj >> 28) != 8) return callOriginal(c, "fn_80029050");
     const u32 saved = rd32(obj + 0xAC);
     wr32(obj + 0xAC, 0);
@@ -248,9 +256,6 @@ HLE(fn_8005D984) {
         sFade = std::min(1.0f, sFade + 1.0f / 6.0f);
     }
     sGameplayLight = false;
-    // Test aid LM_NO_SHADOW=1: shadow strength 0 (the frame without the game's shadows, for
-    // isolating them by difference).
-    static const bool sNoShadow = std::getenv("LM_NO_SHADOW") != nullptr;
     if (sNoShadow && active) wr32(VA(0x804D07E0) + 4, rd32(VA(0x804D07E0) + 4) & ~0xFFu);
 
     const float aspect = rdf32(cam + kCamAspect);
@@ -261,10 +266,8 @@ HLE(fn_8005D984) {
     const bool refit = active && perspective && gameplay && r.shadowAnyDistance &&
                        fitFrustum(cam, wideAspect, aspect / ws::factor(), fit);
 
-    static const bool sLog = std::getenv("LM_SHADOW_LOG") != nullptr;
     static u32 sCalls = 0;
-    static const int sEvery = [] { const char* e = std::getenv("LM_SHADOW_LOG"); return e ? std::max(1, std::atoi(e) == 1 ? 30 : 1) : 30; }();
-    if (sLog && active && (sCalls++ % sEvery) == 0) {
+    if (sShadowLog && active && (sCalls++ % sShadowLogEvery) == 0) {
         const V3 eye = rdv(cam + kCamEye);
         log("[shadow] k3a %u %s eye %.0f %.0f %.0f at %.0f %.0f %.0f fov %.1f asp %.2f near %.0f far %.0f%s",
             rd32(VA(0x804D07E0) + 4) & 0xFF, gameplay ? "game" : "other", eye.x, eye.y, eye.z, target.x, target.y, target.z, fov, wideAspect, zNear,
