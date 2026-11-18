@@ -1,0 +1,218 @@
+0240: Hash a draw's pipeline config once and reuse the draw's ShaderInfo
+
+Every GX draw resolves its pipeline through find_pipeline, which copied the config, canonicalised it
+(build_shader_info: a walk over the TEV stages, texgens and colour channels), hashed the result for
+the known-config bookkeeping (0217's precache list), then hashed it again for the pipeline key. The
+caller, push_gx_draw (lib/gx/command_processor.cpp), had already built exactly that ShaderInfo for
+the alpha-test split, the bind groups and the draw's uniform, and discarded it.
+
+In a macOS `sample` profile of the port (2442 samples on the "Aurora FIFO processor" thread) the
+per-draw lookup is 193 of those samples: 77 in the two XXH3 hashes of the config, 28 in
+build_shader_info, the rest in config copies, the known-config map and the pipeline mutex.
+find_pipeline has an overload that takes the draw's ShaderInfo (the two-argument one still builds it,
+for recording.cpp and enhanced.cpp) and hashes the canonical config once, handing the key to both
+remember_pipeline_config and resolve_pipeline.
+
+The canonical config, the pipeline key, first_frame_used and the isNew/precache behaviour are
+unchanged: gx::canonicalize_pipeline_config clears the same texgens and color channels, and the draw
+path's configs never set depthOnly/lightDepth (populate_pipeline_config starts from an empty
+ShaderConfig), so the enhClass reset does not apply.
+
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -591,6 +591,10 @@
+ // coordinates nothing reads. Equal shaders then share one pipeline, and the precache list holds
+ // one config per shader instead of one per game state (LM: every ghost fade level was a pipeline).
+ void canonicalize_pipeline_config(PipelineConfig& config) noexcept;
++// 0240: the same, for a caller that already built config.shaderConfig's info (the draw path does,
++// lib/gx/command_processor.cpp). `info` is the info of the config before canonicalisation; dstAlpha
++// and enhClass do not change what info reports.
++void canonicalize_pipeline_config(PipelineConfig& config, const ShaderInfo& info) noexcept;
+ // 0217: the two pipelines of the early-Z alpha-test split (lib/gx/command_processor.cpp) for a
+ // config, when its alpha test can reject (false otherwise). The accuracy flag and the GX
+ // z-compare location are the caller's to check.
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -426,7 +426,10 @@
+   return g_device.CreateRenderPipeline(&descriptor);
+ }
+ 
+-void canonicalize_pipeline_config(PipelineConfig& config) noexcept {
++namespace {
++// 0240: field fixes and validity check; must run before build_shader_info (an invalid tevStageCount
++// would walk past tevStages). False: invalid config, nothing else is done.
++bool canonicalize_pipeline_header(PipelineConfig& config) noexcept {
+   if (config.dstAlpha != UINT32_MAX && config.dstAlpha != 0) {
+     config.dstAlpha = 0xFF; // create_pipeline / to_blend_state only test for UINT32_MAX and 0
+   }
+@@ -436,10 +439,15 @@
+     // class only appended the enhanced uniforms to the struct (last, so nothing before moves).
+     sc.enhClass = 0;
+   }
+-  if (sc.tevStageCount > MaxTevStages || sc.numIndStages > MaxIndStages) {
++  return sc.tevStageCount <= MaxTevStages && sc.numIndStages <= MaxIndStages;
++}
++} // namespace
++
++void canonicalize_pipeline_config(PipelineConfig& config, const ShaderInfo& info) noexcept {
++  if (!canonicalize_pipeline_header(config)) {
+     return; // (invalid; validate_config rejects it)
+   }
+-  const ShaderInfo info = build_shader_info(sc);
++  auto& sc = config.shaderConfig;
+   // Texgens: every coordinate the shader generates (sampled, emboss sources) plus any a TEV stage
+   // names (the enhanced shadow receiver looks at the previous stage's texgen type).
+   auto keepTc = info.sampledTexCoords;
+@@ -467,6 +475,15 @@
+   }
+ }
+ 
++void canonicalize_pipeline_config(PipelineConfig& config) noexcept {
++  // build_shader_info reads enhClass (it adds the enhanced uniform), so the header runs first; the
++  // overload applies it again, which is idempotent.
++  if (!canonicalize_pipeline_header(config)) {
++    return;
++  }
++  canonicalize_pipeline_config(config, build_shader_info(config.shaderConfig));
++}
++
+ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
+   ZoneScoped;
+ 
+--- a/lib/gfx/pipeline_cache.hpp
++++ b/lib/gfx/pipeline_cache.hpp
+@@ -8,6 +8,7 @@
+ 
+ namespace aurora::gx {
+ struct PipelineConfig;
++struct ShaderInfo;
+ } // namespace aurora::gx
+ 
+ namespace aurora::rmlui {
+@@ -38,6 +39,11 @@
+ void rebuild_pipeline_cache();
+ 
+ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
++// 0240: `shaderInfo` is build_shader_info of config.shaderConfig, already built by push_gx_draw
++// (lib/gx/command_processor.cpp); it saves a second walk over the TEV stages, texgens and color
++// channels (28 of the FIFO thread's 193 pipeline-lookup samples, macOS `sample` of the port).
++PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout,
++                          const gx::ShaderInfo& shaderInfo);
+ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
+ PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
+ 
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -580,9 +580,11 @@
+   }
+ }
+ 
++// 0240: `cacheKey` is xxh3_hash(config, type), the 0217 key form; hashing the same config here and
++// again in resolve_pipeline was 77 of the FIFO thread's 2442 samples (the same macOS `sample`).
+ template <typename Config>
+-static bool remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist) {
+-  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
++static bool remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist,
++                                     HashType cacheKey) {
+   bool changed = false;
+   bool isNew = false;
+   {
+@@ -596,6 +599,12 @@
+     enqueue_pipeline_cache_write(make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
+   }
+   return isNew;
++}
++
++template <typename Config>
++static bool remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist) {
++  return remember_pipeline_config(type, config, firstFrameUsed, persist,
++                                  xxh3_hash(config, static_cast<HashType>(type)));
+ }
+ 
+ static CompiledPipeline create_pending(PendingPipeline& pending);
+@@ -1114,8 +1123,7 @@
+ }
+ 
+ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
+-                                    PipelinePriority priority) {
+-  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
++                                    PipelinePriority priority, HashType cacheKey) {
+   const auto runtimeKey = xxh3_hash(layout.key, cacheKey);
+   tl_missConfig = &config;
+   tl_missLayout = &layout;
+@@ -1133,6 +1141,12 @@
+   return ref;
+ }
+ 
++// 0240: for callers that have neither a ShaderInfo nor a key (precache, recording).
++static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
++                                    PipelinePriority priority) {
++  return resolve_pipeline(type, config, layout, priority, xxh3_hash(config, static_cast<HashType>(type)));
++}
++
+ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
+                                     const RenderTargetLayout& layout, PipelinePriority priority) {
+   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
+@@ -1940,20 +1954,34 @@
+ static void queue_gx_variants(const gx::PipelineConfig& recorded, uint32_t accuracy, uint32_t enhBits,
+                               absl::flat_hash_set<HashType>* seen);
+ 
+-PipelineRef find_pipeline(const gx::PipelineConfig& drawConfig, const RenderTargetLayout& layout) {
+-  // 0217: pipelines are keyed (and built) by the canonical config.
+-  gx::PipelineConfig config = drawConfig;
+-  gx::canonicalize_pipeline_config(config);
+-  const bool isNew = remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+-  const auto ref = resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
++// 0240: the tail of find_pipeline for a canonical config: one hash feeds both the known-config
++// bookkeeping and the pipeline key.
++static PipelineRef find_canonical_gx_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
++  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
++  const bool isNew = remember_pipeline_config(ShaderType::GX, config, current_frame(), true, cacheKey);
++  const auto ref = resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal, cacheKey);
+   if (isNew) {
+     // A config the precache did not know: queue the variants it leads to under the current
+     // settings now (compiled while this one is), instead of one more miss for each later.
+     queue_gx_variants(config, gx::g_accuracyFlags.load(std::memory_order_relaxed), enhanced::precache_bits(), nullptr);
+   }
+   return ref;
++}
++
++PipelineRef find_pipeline(const gx::PipelineConfig& drawConfig, const RenderTargetLayout& layout) {
++  // 0217: pipelines are keyed (and built) by the canonical config.
++  gx::PipelineConfig config = drawConfig;
++  gx::canonicalize_pipeline_config(config);
++  return find_canonical_gx_pipeline(config, layout);
+ }
+ 
++PipelineRef find_pipeline(const gx::PipelineConfig& drawConfig, const RenderTargetLayout& layout,
++                          const gx::ShaderInfo& shaderInfo) {
++  gx::PipelineConfig config = drawConfig;
++  gx::canonicalize_pipeline_config(config, shaderInfo);
++  return find_canonical_gx_pipeline(config, layout);
++}
++
+ #ifdef AURORA_ENABLE_RMLUI
+ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
+   remember_pipeline_config(ShaderType::Rml, config, 0, true);
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -1193,7 +1193,8 @@
+     state.dirty |= DirtyPipeline;
+   }
+   const u8 lineMode = line_mode_for_prim(prim);
+-  const auto targetLayoutKey = gfx::get_render_target_layout().key;
++  const auto targetLayout = gfx::get_render_target_layout();
++  const auto targetLayoutKey = targetLayout.key;
+   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
+                              cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
+   if (!pipelineValid) {
+@@ -1204,7 +1205,8 @@
+     cache.efbBlend6 = g_drawEfbBlend6;
+     audit_pipeline(cache.config, prim);
+     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+-    cache.pipelineRef = gfx::pipeline_ref(cache.config);
++    // 0240: the shader info built above is the one canonicalisation would build again.
++    cache.pipelineRef = gfx::find_pipeline(cache.config, targetLayout, cache.shaderInfo);
+     cache.targetLayoutKey = targetLayoutKey;
+     cache.fmt = fmt;
+     cache.lineMode = lineMode;
