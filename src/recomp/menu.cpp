@@ -350,7 +350,48 @@ bool tab(const char* name) {
     return ImGui::BeginTabItem(name, nullptr, select ? ImGuiTabItemFlags_SetSelected : 0);
 }
 
-void applyResolution() { VISetFrameBufferScale(float(port::settings().video.resolutionScale)); }
+// "Match window" (resolution_scale 0): one game pixel per window point. Aurora's 0 is the drawable's
+// pixels, twice the points in each direction on a Retina panel, so the default 1280x960 window
+// rendered 2560x1920, 4x the pixels (docs/RENDERING.md "Resolution"). A 1x display is unchanged.
+static float matchWindowScale() {
+    const AuroraWindowSize ws = aurora_get_window_size();
+    return ws.height > 0 ? float(ws.height) / 480.0f : 0.0f;
+}
+
+void applyResolution() {
+    const int rs = port::settings().video.resolutionScale;
+    VISetFrameBufferScale(rs > 0 ? float(rs) : matchWindowScale());
+}
+
+static void applyResolution(const AuroraWindowSize& ws) {
+    const int rs = port::settings().video.resolutionScale;
+    VISetFrameBufferScale(rs > 0 ? float(rs) : (ws.height > 0 ? float(ws.height) / 480.0f : 0.0f));
+}
+
+// Keeps "match window" following a resize (aurora would keep a fixed scale while the window grows),
+// and reports the render size in use: aurora's start-up line prints the window's size before the port
+// applies the resolution setting.
+static void syncMatchWindow() {
+    static int sApplied = -1;
+    static u32 sLoggedW = 0, sLoggedH = 0;
+    const int rs = port::settings().video.resolutionScale;
+    // Two SDL size queries (no allocation): the same call that follows a resize, once per frame.
+    const AuroraWindowSize ws = aurora_get_window_size();
+    if (ws.fb_width != sLoggedW || ws.fb_height != sLoggedH) {
+        sLoggedW = ws.fb_width;
+        sLoggedH = ws.fb_height;
+        std::printf("[video] rendering %ux%u%s (window %ux%u points, %ux%u pixels)\n", ws.fb_width, ws.fb_height,
+                    rs > 0 ? "" : ", match window", ws.width, ws.height, ws.native_fb_width, ws.native_fb_height);
+        std::fflush(stdout);
+    }
+    if (rs > 0) {
+        sApplied = -1;
+        return;
+    }
+    if (ws.height == 0 || int(ws.height) == sApplied) return;
+    sApplied = int(ws.height);
+    applyResolution(ws);
+}
 
 void applyWindowSettings() {
     const auto& v = port::settings().video;
@@ -1516,7 +1557,9 @@ void visualsTab() {
         int& rs = v.resolutionScale;
         char label[64];
         if (rs <= 0) {
-            std::snprintf(label, sizeof(label), "Match window");
+            // The buffer in use: for "match window", the window's size in points.
+            const AuroraWindowSize ws = aurora_get_window_size();
+            std::snprintf(label, sizeof(label), "Match window (%u x %u)", ws.fb_width, ws.fb_height);
         } else {
             const AuroraWindowSize ws = aurora_get_window_size();
             const float aspect = ws.native_fb_height ? float(ws.native_fb_width) / float(ws.native_fb_height) : 4.0f / 3.0f;
@@ -1529,7 +1572,8 @@ void visualsTab() {
             applyResolution();
         }
         ImGui::SetItemTooltip("Internal resolution as a multiple of the console's 480 lines (1x = 640x480).\n"
-                              "Match window: the window's own resolution. Higher is sharper and costs GPU time.");
+                              "Match window: one game pixel per window point, the size a 1x display would\n"
+                              "render. Higher is sharper and costs GPU time.");
     }
     if (recomp::menu::Checkbox("Fullscreen", &v.fullscreen)) {
         sDirty = true;
@@ -2141,6 +2185,7 @@ bool SliderInt(const char* label, int* v, int min, int max, const char* format, 
 void draw() {
     click::frame();
     scriptedSettings();
+    syncMatchWindow();
     recomp::texpacks::hostFrame();
     skip::drawOverlay();
     recomp::gx::applyAccuracySettings();

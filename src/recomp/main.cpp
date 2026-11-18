@@ -550,6 +550,10 @@ int main(int argc, char* argv[]) {
         if (!running || menu::quitRequested()) break;
     }
 
+    // A normal quit: nothing below may be reported as a hang (the watchdog would otherwise call the
+    // GPU-object release and the cache writes a stalled main loop and dump every thread). A real
+    // crash in the shutdown is still reported by the crash handler.
+    port::setShuttingDown();
     port::setPhase("shutdown (releasing graphics objects, writing caches)");
     menu::shutdown();
     vi::stopTimer();

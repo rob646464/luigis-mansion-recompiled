@@ -13,6 +13,13 @@ void heartbeat();
 // What the main thread is doing, for the hang log (a string literal: kept by pointer); nullptr
 // while it waits on purpose (paused in the background), which is never reported.
 void setPhase(const char* phase);
+// The phase set by setPhase (what the main thread is doing), for other logs.
+const char* phase();
+// The main loop has ended on purpose and the process is tearing down: the hang watchdog and
+// reportStall stay quiet from here on (releasing the GPU objects and writing the caches can take a
+// while, which is not a hang), and the run is recorded as a clean exit, so a kill during the shutdown
+// does not look like a crash at the next start. A crash in the shutdown is still reported.
+void setShuttingDown();
 // Extra state for every hang report (what Aurora's threads are doing, whether the game kept
 // running). Called on the watchdog thread: with stallBegins = true when the main thread has just
 // missed its first heartbeat (remember counters; `out` is ignored), false for a report.
