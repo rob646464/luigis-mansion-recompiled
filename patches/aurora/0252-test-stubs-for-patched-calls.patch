@@ -1,0 +1,97 @@
+0252: test stubs for the calls the local patches add to command_processor/texture
+
+gx_fifo_tests and gx_texture_cache_tests have not linked since 0016 (enhanced lighting), 0009 (EFB
+copies to RAM), 0176 (6-bit blending), 0217 (variants), 0250 (copy reclamation) and 0240
+(find_pipeline takes the draw's ShaderInfo) added calls into them: the test stubs cover the pre-patch
+surface only, so both binaries stopped at the link step and neither suite ran. The stubs are the
+disabled form of each call (no device in these tests): enhanced config disabled,
+sync_config/note_draw false, set_lights/scene_end no-ops, EFB copy ops empty, current_frame 0,
+evict_copy_slots no-op, the accuracy globals zeroed. 204 and 18 tests pass.
+
+--- a/tests/gx_test_stubs.cpp
++++ b/tests/gx_test_stubs.cpp
+@@ -14,6 +14,7 @@
+ #include "gfx/texture_replacement.hpp"
+ #include "gx/pipeline.hpp"
+ #include "gx/shader_info.hpp"
++#include "gfx/enhanced.hpp"
+ #include "internal.hpp"
+ #include "webgpu/gpu.hpp"
+ 
+@@ -283,7 +284,47 @@
+ bool has_replacement(const GXTexObj_&) noexcept { return false; }
+ bool has_replacement(const GXTexObj_&, const GXTlutObj_&) noexcept { return false; }
+ } // namespace aurora::gfx::texture_replacement
++
++// --- Stubs for the calls local patches add to command_processor/texture ---
++// (0016 enhanced lighting, 0009 EFB copies to RAM, 0176 6-bit blending, 0217 variants, 0250 copy
++// reclamation, 0240's find_pipeline overload). No device in these tests: disabled/no-op forms.
++namespace aurora::gx {
++std::atomic<u32> g_accuracyFlags{0};
++std::atomic<u32> g_texGenBeyondCount{0};
++u8 g_drawEfbBlend6 = 0;
++} // namespace aurora::gx
++
++namespace aurora::gfx {
++uint32_t current_frame() noexcept { return 0; }
++PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout,
++                          const gx::ShaderInfo& shaderInfo) {
++  return 0;
++}
++gx::DrawData* get_draw_command_before_last() { return nullptr; }
++void note_efb_blend6(bool dither) noexcept {}
++void set_next_resolve_op(efb_ram::PassOp op) {}
++} // namespace aurora::gfx
+ 
++namespace aurora::gfx::enhanced {
++static const AuroraEnhancedConfig s_config{};
++const AuroraEnhancedConfig& config() noexcept { return s_config; }
++bool sync_config() noexcept { return false; }
++void set_lights(const ExtraLight* lights, uint32_t count) noexcept {}
++bool note_draw(const gx::PipelineConfig& config, uint8_t drawClass, uint32_t vtxCount, const gx::DrawData& data) noexcept {
++  return false;
++}
++void scene_end() noexcept {}
++} // namespace aurora::gfx::enhanced
++
++namespace aurora::gfx::efb_ram {
++PassOp on_copy(const void* dest, GXTexFmt fmt, uint32_t width, uint32_t height, const TextureHandle& copy) {
++  return {};
++}
++void set_generation(uint8_t generation, bool replaying, bool noReadback) {}
++void save_slot(uint8_t slot) {}
++void restore_slot(uint8_t slot) {}
++} // namespace aurora::gfx::efb_ram
++
+ // --- Window stub ---
+ #include "../lib/window.hpp"
+ namespace aurora::window {
+--- a/tests/gx_texture_cache_test_stubs.cpp
++++ b/tests/gx_texture_cache_test_stubs.cpp
+@@ -111,8 +111,26 @@
+ void queue_palette_conv(tex_palette_conv::ConvRequest req) { ++s_paletteConversions; }
+ } // namespace aurora::gfx
+ 
++namespace aurora::gfx {
++// 0250: the counter the real texture code charges; the cache test only needs the symbols.
++std::atomic<uint64_t> TextureMemCounter::s_count{0}, TextureMemCounter::s_bytes{0};
++uint32_t current_frame() noexcept { return 0; }
++} // namespace aurora::gfx
++
++namespace aurora::gx::fifo {
++void evict_copy_slots(const void* dest) noexcept {}
++} // namespace aurora::gx::fifo
++
++namespace aurora::gfx::efb_ram {
++TextureHandle resolve_texture(const GXTexObj_& obj) { return {}; }
++void sweep(std::vector<const void*>& evict) {}
++} // namespace aurora::gfx::efb_ram
++
+ namespace aurora::gfx::texture_replacement {
+ StreamingStats process_streaming() noexcept { return {}; }
++bool dumping() noexcept { return false; }
++void note_texture_for_dump(const GXTexObj_& obj, const GXTlutObj_* tlut,
++                           const aurora::texture::TextureSourceKey& key) noexcept {}
+ 
+ std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) noexcept {
+   return s_replacementId != 0 ? std::optional{ReplacementResult{.handle = s_replacement, .id = s_replacementId}}
