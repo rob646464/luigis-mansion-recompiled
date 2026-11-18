@@ -12,16 +12,12 @@
   replays tapes, and the replay state slots lose the destination too), copy-texture cache entries
   not copied into for 1800 frames are dropped, and beyond 128 destinations the least recently
   copied go. Byte buffers no tracked copy uses are released.
-* Shader modules: Dawn keeps a module's parsed shader program (Tint, ~1 MB for a GX shader) while
-  anything outside Dawn references the module, and only builds it for a shader it compiles (not
-  for one loaded from its cache). 0227's session-long module cache so kept every module compiled
-  on a cache miss: a cold start held 2.1 GB (default settings) to 8 GB (Enhanced lighting at 120
-  fps), slowed the compile down and made the exit take minutes. The cache keeps the
-  latest 384 modules and is released whenever no pipeline is left to build.
+* Shader modules: 0227's session-long module cache kept every module compiled on a cache miss, and
+  Dawn holds a module's parsed shader program (Tint, ~1 MB for a GX shader) while anything outside
+  Dawn references it: a cold start held 2.1 GB (default settings) to 8 GB (Enhanced lighting at 120
+  fps), slowed the compile down and made the exit take minutes. The cache keeps the latest 384
+  modules and is released whenever no pipeline is left to build.
 
-diff --git a/include/aurora/mem_stats.h b/include/aurora/mem_stats.h
-new file mode 100644
-index 0000000..15e83b6
 --- /dev/null
 +++ b/include/aurora/mem_stats.h
 @@ -0,0 +1,29 @@
@@ -54,8 +50,6 @@ index 0000000..15e83b6
 +#ifdef __cplusplus
 +}
 +#endif
-diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
-index 34fa8e5..e53dfa7 100644
 --- a/lib/dolphin/gx/GXFrameBuffer.cpp
 +++ b/lib/dolphin/gx/GXFrameBuffer.cpp
 @@ -2,6 +2,7 @@
@@ -66,16 +60,13 @@ index 34fa8e5..e53dfa7 100644
  #include "../../gfx/tex_copy_conv.hpp"
  #include "../../gfx/texture.hpp"
  #include "../../gfx/recording.hpp"
-@@ -67,6 +68,7 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
+@@ -67,5 +68,6 @@
    gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
                           clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
    ++handle.revision;
 +  handle.lastCopyFrame = gfx::current_frame();  // 0250: copy textures not copied into for long are dropped
    g_gxState.copyTextures[dest] = handle;
    texture::invalidate_bindings();
- }
-diff --git a/lib/gfx/efb_ram.cpp b/lib/gfx/efb_ram.cpp
-index ac9bfd5..4b892d4 100644
 --- a/lib/gfx/efb_ram.cpp
 +++ b/lib/gfx/efb_ram.cpp
 @@ -14,6 +14,7 @@
@@ -86,7 +77,7 @@ index ac9bfd5..4b892d4 100644
  
  #include <absl/container/flat_hash_map.h>
  #include <magic_enum.hpp>
-@@ -1020,6 +1021,60 @@ void restore_slot(uint8_t slot) {
+@@ -1020,6 +1021,60 @@
    }
  }
  
@@ -147,7 +138,7 @@ index ac9bfd5..4b892d4 100644
  } // namespace aurora::gfx::efb_ram
  
  using namespace aurora::gfx::efb_ram;
-@@ -1155,3 +1210,21 @@ void aurora_efb_ram_get_stats(AuroraEfbRamStats* out) {
+@@ -1155,3 +1210,21 @@
    std::lock_guard lock{g_mutex};
    *out = g_stats;
  }
@@ -169,8 +160,6 @@ index ac9bfd5..4b892d4 100644
 +  out.efbGuestCopies = g_guestCopies.size();
 +}
 +} // namespace aurora::gfx::efb_ram
-diff --git a/lib/gfx/efb_ram.hpp b/lib/gfx/efb_ram.hpp
-index 5d0aa2f..8b990f9 100644
 --- a/lib/gfx/efb_ram.hpp
 +++ b/lib/gfx/efb_ram.hpp
 @@ -21,6 +21,7 @@
@@ -181,7 +170,7 @@ index 5d0aa2f..8b990f9 100644
  
  struct GXTexObj_;
  
-@@ -58,4 +59,12 @@ void set_generation(uint8_t generation, bool replaying, bool noReadback);
+@@ -58,4 +59,12 @@
  void save_slot(uint8_t slot);
  void restore_slot(uint8_t slot);
  
@@ -194,8 +183,6 @@ index 5d0aa2f..8b990f9 100644
 +void sweep(std::vector<const void*>& evict);
 +
  } // namespace aurora::gfx::efb_ram
-diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
-index 96667e1..ad23825 100644
 --- a/lib/gfx/pipeline_cache.cpp
 +++ b/lib/gfx/pipeline_cache.cpp
 @@ -14,6 +14,8 @@
@@ -207,7 +194,7 @@ index 96667e1..ad23825 100644
  #include <algorithm>
  #include <atomic>
  #include <condition_variable>
-@@ -211,6 +213,11 @@ static std::condition_variable g_pipelineReadyCv;
+@@ -212,6 +214,11 @@
  static absl::flat_hash_map<PipelineRef, CompiledPipeline> g_pipelines;
  static absl::flat_hash_map<HashType, KnownPipeline> g_knownPipelines;
  static std::optional<uint64_t> g_pipelineLayoutKey;
@@ -219,7 +206,7 @@ index 96667e1..ad23825 100644
  static std::deque<PendingPipeline> g_pipelineQueue;
  static std::deque<PendingPipeline> g_backgroundPipelineQueue;
  static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
-@@ -2223,6 +2230,18 @@ void begin_pipeline_frame() {
+@@ -2355,6 +2362,18 @@
      g_pipelinesPerFrame = 0;
    }
    journal_update_phase();
@@ -238,21 +225,20 @@ index 96667e1..ad23825 100644
    if (g_pipelineLayoutKey != scene_render_target_layout().key ||
        g_rebuildAccuracy != gx::g_accuracyFlags.load(std::memory_order_relaxed) ||
        g_rebuildEnhBits != enhanced::precache_bits()) {
-diff --git a/lib/gfx/resource_cache.cpp b/lib/gfx/resource_cache.cpp
-index 8c131ab..eb523ef 100644
 --- a/lib/gfx/resource_cache.cpp
 +++ b/lib/gfx/resource_cache.cpp
-@@ -3,6 +3,9 @@
+@@ -3,7 +3,10 @@
  #include "frame.hpp"
  #include "hash.hpp"
  #include "../webgpu/gpu.hpp"
 +#include "texture.hpp"
-+
-+#include <aurora/mem_stats.h>
  
++#include <aurora/mem_stats.h>
++
  #include <cstddef>
  #include <cstdint>
-@@ -104,6 +107,8 @@ wgpu::BindGroup find_bind_group(BindGroupRef id) {
+ #include <mutex>
+@@ -104,6 +107,8 @@
    return it->second.bindGroup;
  }
  
@@ -261,7 +247,7 @@ index 8c131ab..eb523ef 100644
  wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) {
    const auto id = xxh3_hash(descriptor);
    std::lock_guard lock{g_samplerCacheMutex};
-@@ -114,4 +119,35 @@ wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) {
+@@ -114,4 +119,35 @@
    return it->second;
  }
  
@@ -297,8 +283,6 @@ index 8c131ab..eb523ef 100644
 +  pipeline_mem_stats(*out);
 +  aurora::gx::shader_module_mem_stats(*out);
 +}
-diff --git a/lib/gfx/texture.hpp b/lib/gfx/texture.hpp
-index 2cff180..55bccad 100644
 --- a/lib/gfx/texture.hpp
 +++ b/lib/gfx/texture.hpp
 @@ -1,6 +1,9 @@
@@ -311,7 +295,7 @@ index 2cff180..55bccad 100644
  #include <utility>
  
  #include "types.hpp"
-@@ -33,6 +36,29 @@ uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t
+@@ -33,6 +36,29 @@
  bool is_block_aligned(wgpu::TextureFormat format, uint32_t width, uint32_t height) noexcept;
  
  constexpr u32 InvalidTextureFormat = -1;
@@ -341,7 +325,7 @@ index 2cff180..55bccad 100644
  struct TextureRef {
    wgpu::Texture texture;
    wgpu::TextureView sampleTextureView;
-@@ -43,6 +69,7 @@ struct TextureRef {
+@@ -43,6 +69,7 @@
    u32 gxFormat;
    bool hasArbitraryMips = false;
    bool isReplacement = false;
@@ -349,7 +333,7 @@ index 2cff180..55bccad 100644
  
    TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
               wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
-@@ -52,7 +79,9 @@ struct TextureRef {
+@@ -52,7 +79,9 @@
    , size(size)
    , format(format)
    , mipCount(mipCount)
@@ -360,11 +344,9 @@ index 2cff180..55bccad 100644
  };
  
  TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index efec2a1..daee721 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
-@@ -256,6 +256,20 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
+@@ -258,6 +258,20 @@
  
  static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
  static void handle_aurora(ByteReader& reader) noexcept;
@@ -385,7 +367,7 @@ index efec2a1..daee721 100644
  static u32 calc_vtx_size(GXVtxFmt fmt) noexcept;
  
  // ---- Malformed FIFO data (0235) -----------------------------------------------------------------
-@@ -1889,8 +1903,6 @@ void handle_aurora(ByteReader& reader) noexcept {
+@@ -2027,8 +2041,6 @@
      // and the per-frame cache state (array upload ranges, texture binds), which is rebuilt.
      // Slots 4..7 (GX_AURORA_SET_REPLAY_MASK passes) hold the GX state only.
      static std::array<std::unique_ptr<GXState>, 8> sSlots;
@@ -394,11 +376,9 @@ index efec2a1..daee721 100644
      const u8 slot = reader.read<u8>() & 7;
      auto& state = g_gxState;
      const u8 generation = state.copyGeneration;
-diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
-index b2a0ecc..28775c7 100644
 --- a/lib/gx/gx.hpp
 +++ b/lib/gx/gx.hpp
-@@ -315,6 +315,7 @@ struct GXState {
+@@ -315,6 +315,7 @@
    struct CopyTextureRef {
      gfx::TextureHandle handle;
      u32 revision = 0;
@@ -406,7 +386,7 @@ index b2a0ecc..28775c7 100644
  
      operator bool() const noexcept { return handle.operator bool(); }
    };
-@@ -467,6 +468,9 @@ void set_viewport_policy(AuroraViewportPolicy policy) noexcept;
+@@ -467,6 +468,9 @@
  void clear_static_texture_cache() noexcept;
  void clear_copy_texture_cache() noexcept;
  void evict_copy_texture(const void* dest) noexcept;
@@ -416,7 +396,7 @@ index b2a0ecc..28775c7 100644
  void evict_texture_object(u32 texObjId) noexcept;
  void evict_tlut_object(u32 tlutObjId) noexcept;
  Vec2<uint32_t> logical_fb_size() noexcept;
-@@ -603,6 +607,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
+@@ -611,6 +615,7 @@
  HashType shader_module_key(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                             DstAlphaMode dstAlphaMode) noexcept;
  void clear_shader_module_cache() noexcept;
@@ -424,8 +404,6 @@ index b2a0ecc..28775c7 100644
  GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
  
  u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
-diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index dac2a9c..376deda 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
 @@ -9,10 +9,12 @@
@@ -441,17 +419,15 @@ index dac2a9c..376deda 100644
  #include <mutex>
  
  namespace aurora::gx {
-@@ -21,12 +23,41 @@ namespace aurora::gx {
+@@ -21,14 +23,41 @@
  // Tint parse/validation (about a quarter of a cached pipeline's creation time); the pipelines of
  // one shader for other blend/depth/cull states, render targets and the alpha pre-pass reuse it.
  // Only modules that compiled are kept. The pipelines hold their modules anyway.
 +//
-+// 0250 (LM issue #34): Dawn keeps a module's parsed shader program (Tint, ~1 MB for a GX shader)
-+// while anything outside Dawn references the module, and creates it only for a shader it has to
-+// compile (not for one loaded from its cache). Kept for the whole session, a cold start's modules
-+// held 2.1 GB (default settings) and more with Enhanced lighting's variants. The cache now keeps
-+// the most recent MaxCachedModules modules (a shader's variants are queued together) and is
-+// released whenever no pipeline is left to build.
++// 0250 (LM issue #34): Dawn builds a module's parsed shader program (Tint) only for a shader it
++// has to compile, not for one loaded from its cache, and holds it while anything outside Dawn
++// references the module - so a session-long cache kept every module a cold start compiled. Bounded
++// here, and released whenever no pipeline is left to build.
 +constexpr size_t MaxCachedModules = 384;
  static std::mutex g_moduleMutex;
  static absl::flat_hash_map<HashType, wgpu::ShaderModule> g_modules;
@@ -461,8 +437,8 @@ index dac2a9c..376deda 100644
    std::lock_guard lock{g_moduleMutex};
    g_modules.clear();
 +  g_moduleOrder.clear();
-+}
-+
+ }
+ 
 +// 0250: drops the cached modules (released outside the lock), when there are any.
 +void release_shader_module_cache() noexcept {
 +  absl::flat_hash_map<HashType, wgpu::ShaderModule> old;
@@ -476,14 +452,16 @@ index dac2a9c..376deda 100644
 +  }
 +}
 +
-+// 0250: for aurora_mem_stats.
++// 0250: cache sizes for aurora_mem_stats.
 +void shader_module_mem_stats(AuroraMemStats& out) noexcept {
 +  std::lock_guard lock{g_moduleMutex};
 +  out.shaderModules = g_modules.size();
- }
- 
++}
++
  gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
-@@ -51,8 +82,18 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
+   ZoneScoped;
+   const auto hash = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
+@@ -51,8 +80,18 @@
        if (!gfx::pop_shader_error_scope("GX shader")) {
          return wgpu::RenderPipeline{};
        }
@@ -503,8 +481,6 @@ index dac2a9c..376deda 100644
      }
      const auto label = fmt::format("GX Pipeline {:x} {}", hash, passName);
      const uint64_t t0 = gfx::now_ns(); // 0226
-diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
-index 69db264..09d46b0 100644
 --- a/lib/gx/texture.cpp
 +++ b/lib/gx/texture.cpp
 @@ -1,5 +1,7 @@
@@ -515,18 +491,21 @@ index 69db264..09d46b0 100644
  #include "../gfx/recording.hpp"
  #include "../gfx/tex_palette_conv.hpp"
  #include "../gfx/texture_convert.hpp"
-@@ -10,6 +12,7 @@
+@@ -10,7 +12,8 @@
  #include <absl/container/flat_hash_set.h>
  #include <tracy/Tracy.hpp>
  #include <xxhash.h>
 +#include <aurora/mem_stats.h>
  
  #include <algorithm>
+ #include <array>
  #include <atomic>
-@@ -698,7 +701,77 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+@@ -805,9 +808,79 @@
+     store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId);
+   }
    return handle;
- }
- 
++}
++
 +// 0250: cache sizes for aurora_mem_stats, published by the thread that owns the caches.
 +static std::atomic<uint64_t> s_memTexObjects, s_memContentEntries, s_memContentBytes, s_memTluts, s_memCopyTextures,
 +    s_memCopyCacheEntries, s_memCopyCacheBytes;
@@ -581,8 +560,8 @@ index 69db264..09d46b0 100644
 +    }
 +    evict_copy_texture(oldest->first);
 +  }
-+}
-+
+ }
+ 
  void end_frame() noexcept {
 +  sweep_copy_textures();
 +  if ((s_frameCount & 31) == 0) {
@@ -601,7 +580,7 @@ index 69db264..09d46b0 100644
    const auto streamingStats = gfx::texture_replacement::process_streaming();
    s_stats.pendingLoads = streamingStats.pendingLoads;
    s_stats.publishes = streamingStats.publishes;
-@@ -801,6 +874,7 @@ void clear_copy_texture_cache() noexcept {
+@@ -912,6 +985,7 @@
  void clear_static_texture_cache() noexcept { s_pendingCacheClears.fetch_add(1, std::memory_order_release); }
  
  void evict_copy_texture(const void* dest) noexcept {

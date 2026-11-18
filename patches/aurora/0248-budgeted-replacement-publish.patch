@@ -1,0 +1,487 @@
+0248: Publish a replacement texture within the frame budget, not the whole mip chain at once
+
+Replacement textures (texture packs) are uploaded on the presenting thread: gx::texture::end_frame
+runs after gx::fifo::drain and before gfx::finish in aurora::end_frame (lib/aurora.cpp, activity
+scope "Host"), and calls texture_replacement::process_streaming. process_streaming took a decoded
+replacement and published it whole in that frame: create_converted_texture_handle does
+Device::CreateTexture plus write_texture of every mip level, and publish_fits_budget exempted the
+frame's first publish from ReplacementPublishBudgetBytes (12 MiB), whatever its size.
+
+A 4096x4096 pack texture is about 21 MB as BC7 with its mips and 85 MB as RGBA8. Upstream that
+becomes, on the thread that presents the frame: a memcpy of the whole chain into the frame's upload
+range (TextureUploadSize, 24 MiB, lib/gfx/resources.hpp) or, past it, a dedicated mappedAtCreation
+"Overflow Texture Upload Buffer" per mip (lib/gfx/recording.cpp, queue_texture_upload_data), the
+CopyBufferToTexture commands, and the new texture object. LM's pack playtest
+A 30 minute playtest log shows what that costs: worst frame 2911, 3013, 2174 and
+1787 ms in the windows at 886-897 s and 95 s with the pack on, none in the runs without it, in
+rooms whose textures are that size.
+
+Now the budget is spent strictly, a row range per mip level at a time (write_texture_rows: the same
+per-mip layout and upload path write_texture uses, with origin.y at the first block row), and a
+publication continues on the next frame until its last range is written. The texture object is
+created with the first range and the handle joins the replacement cache only after the last one, so
+no draw ever samples a partly written texture: until then the game's own texture is drawn, exactly
+as while the replacement file was still decoding. One frame's publishing therefore costs at most
+ReplacementPublishBudgetBytes (12 MiB, a row at most 64 KiB) plus one CreateTexture; the multi-second
+freeze becomes the original drawn for the frames the chain still needs: two for the 4K BC7 case,
+seven for the 85 MB RGBA8 one (0.07 s and 0.23 s at 30 fps).
+
+What is rendered once a replacement is published, the replacement cache and its LRU budget
+(set_replacement_cache_budget), the order replacements are chosen in, and the one
+invalidate_replacement + invalidate_bindings per completed replacement are unchanged: the same
+pixels, and the same cache behaviour, only the upload is spread over frames.
+texture_publish_stats() (TexturePublishStats) reports what proves that on the next playtest
+(replacements completed, bytes published, frames that ended with work left, the worst single frame
+and its time on the presenting thread, the queue behind the budget, bytes in flight, evictions); the
+port logs it as the [texpack] line behind LM_TEXPACK_LOG (docs/TEXTURE_PACKS.md).
+
+--- a/include/aurora/texture.hpp
++++ b/include/aurora/texture.hpp
+@@ -61,6 +61,25 @@
+ /// Returns nullopt if the filename is invalid.
+ std::optional<TextureSourceKey> parse_replacement_filename(std::string_view filename) noexcept;
+ 
++/// Publishing decoded replacements (LM 0248). Each one is uploaded at the end of a frame, on the
++/// presenting thread, within a per-frame byte budget (gx::texture::ReplacementPublishBudgetBytes):
++/// one too large for a frame is written a row range at a time over the following frames, and the
++/// game's own texture is drawn until the last range lands, as for a replacement still loading.
++/// Counters are cumulative since start; the worstFrame values cover the frames since the previous
++/// call, so a caller that reports every few seconds sees that interval only.
++struct TexturePublishStats {
++  uint64_t completed = 0;        // replacements whose last row range was written
++  uint64_t publishedBytes = 0;   // bytes uploaded for replacements
++  uint64_t deferredFrames = 0;   // frames that ended with publishing still to do
++  uint64_t evictions = 0;        // replacements released by set_replacement_cache_budget
++  uint64_t queued = 0;           // replacements decoded and waiting for the budget
++  uint64_t inFlightBytes = 0;    // bytes still to write for the replacement being published
++  uint64_t worstFrameBytes = 0;  // worst single frame's publishing since the previous call
++  uint64_t worstFrameMicros = 0; // time that publishing took on the presenting thread
++  uint64_t budgetBytes = 0;      // the per-frame publish budget
++};
++TexturePublishStats texture_publish_stats();
++
+ /// Callback source for replacement files that do not live on the filesystem.
+ ///
+ /// read() loads the entire encoded file at `path` into outBytes, returning false if the file is
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -270,6 +270,44 @@
+                                       std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
+ }
+ 
++// 0248: one row range of one mip level, the shape write_texture and write_texture_rows share. Keeping
++// both on one code path is what makes a chunked upload identical to a whole-chain one.
++namespace {
++void write_texture_mip_rows(TextureRef& ref, const uint8_t* data, uint32_t mip, uint32_t firstRow,
++                            uint32_t rowCount) noexcept {
++  const wgpu::Extent3D mipSize{
++      .width = std::max(ref.size.width >> mip, 1u),
++      .height = std::max(ref.size.height >> mip, 1u),
++      .depthOrArrayLayers = ref.size.depthOrArrayLayers,
++  };
++  const auto info = format_info(ref.format);
++  const auto physicalSize = physical_size(mipSize, info);
++  const uint32_t bytesPerRow = physicalSize.width / info.blockWidth * info.blockSize;
++  [[maybe_unused]] const uint32_t rowsInMip = physicalSize.height / info.blockHeight; // read by the CHECK
++  CHECK(firstRow + rowCount <= rowsInMip, "write_texture_rows: rows {}..{} of a mip with {} rows", firstRow,
++        firstRow + rowCount, rowsInMip);
++  const wgpu::TexelCopyTextureInfo dstView{
++      .texture = ref.texture,
++      .mipLevel = mip,
++      .origin = {.x = 0, .y = firstRow * info.blockHeight, .z = 0},
++  };
++  const wgpu::Extent3D sliceSize{
++      .width = physicalSize.width,
++      .height = rowCount * info.blockHeight,
++      .depthOrArrayLayers = mipSize.depthOrArrayLayers,
++  };
++  if constexpr (UseTextureBuffer) {
++    queue_texture_upload_data(data, bytesPerRow, rowCount, std::move(dstView), sliceSize);
++  } else {
++    const wgpu::TexelCopyBufferLayout dataLayout{
++        .bytesPerRow = bytesPerRow,
++        .rowsPerImage = rowCount,
++    };
++    g_queue.WriteTexture(&dstView, data, bytesPerRow * rowCount * mipSize.depthOrArrayLayers, &dataLayout, &sliceSize);
++  }
++}
++} // namespace
++
+ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+   ZoneScoped;
+ 
+@@ -297,24 +335,18 @@
+     const uint32_t dataSize = bytesPerRow * heightBlocks * mipSize.depthOrArrayLayers;
+     CHECK(offset + dataSize <= data.size(), "write_texture: expected at least {} bytes, got {}", offset + dataSize,
+           data.size());
+-    const wgpu::TexelCopyTextureInfo dstView{
+-        .texture = ref.texture,
+-        .mipLevel = mip,
+-    };
+-    if constexpr (UseTextureBuffer) {
+-      queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
+-    } else {
+-      const wgpu::TexelCopyBufferLayout dataLayout{
+-          .bytesPerRow = bytesPerRow,
+-          .rowsPerImage = heightBlocks,
+-      };
+-      g_queue.WriteTexture(&dstView, data.data() + offset, dataSize, &dataLayout, &physicalSize);
+-    }
++    write_texture_mip_rows(ref, data.data() + offset, mip, 0, heightBlocks);
+     offset += dataSize;
+   }
+   if (data.size() != UINT32_MAX && offset < data.size()) {
+     Log.warn("write_texture: texture used {} bytes, but given {} bytes", offset, data.size());
+   }
++}
++
++void write_texture_rows(TextureRef& ref, const uint8_t* data, uint32_t mip, uint32_t firstRow,
++                        uint32_t rowCount) noexcept {
++  ZoneScoped;
++  write_texture_mip_rows(ref, data, mip, firstRow, rowCount);
+ }
+ 
+ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -62,6 +62,12 @@
+ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
++// 0248: `rowCount` rows (in the format's blocks) of one mip level, starting at block row `firstRow`,
++// from `data` (that many tightly packed texel rows). Same layout and upload path as write_texture,
++// so a chain written row range by row range is identical to one written whole; lets a large
++// replacement texture go up a slice per frame instead of all in the frame it finished decoding.
++void write_texture_rows(TextureRef& ref, const uint8_t* data, uint32_t mip, uint32_t firstRow,
++                        uint32_t rowCount) noexcept;
+ }; // namespace aurora::gfx
+ 
+ struct GXTexObj_ {
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -147,13 +147,42 @@
+ std::deque<LoadJob> s_highPriorityJobs;
+ std::deque<LoadJob> s_lowPriorityJobs;
+ std::deque<LoadCompletion> s_workerCompletions;
+-std::vector<LoadCompletion> s_readyPublishes;
++std::deque<LoadCompletion> s_readyPublishes; // decoded, waiting to be published (host thread)
+ std::unordered_map<uint64_t, uint64_t> s_pendingFullLoads;
+ std::unordered_set<uint64_t> s_pendingThumbnailLoads;
+ std::vector<thread::Thread> s_workers;
+ uint64_t s_requestSequence = 0;
+ bool s_workersPaused = false;
+ uint32_t s_workerCountOverride = 0;
++
++// 0248: publishing a decoded replacement. The whole mip chain used to go up in one frame, on the
++// presenting thread, under a budget whose first publish of the frame was exempt from its own limit
++// (a 3 s stall per 4096x4096 pack texture in a playtest with the 4K pack). Now a publish spends at
++// most ReplacementPublishBudgetBytes per frame, a row range at a time, and its handle joins the
++// replacement cache only when the last row is written, so no draw ever samples a partly written
++// texture: the game's own is drawn until then, as for a replacement still loading.
++struct PendingPublish {
++  EntryLoadSnapshot entry;
++  gfx::ConvertedTexture texture;
++  gfx::TextureHandle handle; // created with the first row range, cached when the last one is written
++  uint32_t nextMip = 0;
++  uint32_t nextRow = 0; // block row in nextMip
++  uint64_t offset = 0;  // byte offset of nextRow in texture.data
++  uint64_t bytes = 0;   // the whole chain, converted_upload_bytes
++  uint64_t written = 0; // budgeted bytes of it written so far
++};
++std::optional<PendingPublish> s_publish; // host thread (process_streaming)
++
++// For texture_publish_stats (the port's [texpack] line, read from another thread): plain atomics.
++// s_publishQueued/InFlightBytes are snapshotted by the host thread each frame.
++std::atomic<uint64_t> s_publishCompleted = 0;
++std::atomic<uint64_t> s_publishBytesTotal = 0;
++std::atomic<uint64_t> s_publishDeferredFrames = 0;
++std::atomic<uint64_t> s_publishQueued = 0;
++std::atomic<uint64_t> s_publishInFlightBytes = 0;
++std::atomic<uint64_t> s_publishWorstFrameBytes = 0;
++std::atomic<uint64_t> s_publishWorstFrameMicros = 0;
++std::atomic<uint64_t> s_replacementEvictions = 0;
+ 
+ const ReplacementEntry* find_selected_entry_locked(const ReplacementKey& key) noexcept;
+ ReplacementEntry* find_entry_locked(const ReplacementKey& key, uint64_t id) noexcept;
+@@ -880,6 +909,9 @@
+     s_workersPaused = false;
+   }
+   s_readyPublishes.clear();
++  s_publish.reset(); // 0248: a part-written replacement is not continued across a reload/shutdown
++  s_publishQueued.store(0, std::memory_order_relaxed);
++  s_publishInFlightBytes.store(0, std::memory_order_relaxed);
+ }
+ 
+ void queue_full_load(const EntryLoadSnapshot& entry) {
+@@ -924,20 +956,35 @@
+   return s_pendingFullLoads.size();
+ }
+ 
++// One mip level's rows: `bytesPerRow` is how the upload data is packed (gfx::write_texture_rows),
++// `budgetBytesPerRow` how the publish budget counts a row (256-byte alignment, as before 0248).
++struct MipRowLayout {
++  uint64_t bytesPerRow = 0;
++  uint64_t budgetBytesPerRow = 0;
++  uint32_t rows = 0;
++};
++
++MipRowLayout mip_row_layout(const gfx::ConvertedTexture& texture, uint32_t mip) noexcept {
++  const auto info = gfx::format_info(texture.format);
++  const uint64_t width = std::max(texture.width >> mip, 1u);
++  const uint64_t height = std::max(texture.height >> mip, 1u);
++  const uint64_t widthBlocks = (width + info.blockWidth - 1) / info.blockWidth;
++  const uint64_t heightBlocks = (height + info.blockHeight - 1) / info.blockHeight;
++  return {
++      .bytesPerRow = widthBlocks * info.blockSize,
++      .budgetBytesPerRow = AURORA_ALIGN(widthBlocks * info.blockSize, 256),
++      .rows = static_cast<uint32_t>(heightBlocks),
++  };
++}
++
+ uint64_t converted_upload_bytes(const gfx::ConvertedTexture& texture) noexcept {
+-  const auto info = gfx::format_info(texture.format);
+   uint64_t total = 0;
+   for (uint32_t mip = 0; mip < texture.mips; ++mip) {
+-    const uint64_t width = std::max(texture.width >> mip, 1u);
+-    const uint64_t height = std::max(texture.height >> mip, 1u);
+-    const uint64_t widthBlocks = (width + info.blockWidth - 1) / info.blockWidth;
+-    const uint64_t heightBlocks = (height + info.blockHeight - 1) / info.blockHeight;
+-    const uint64_t bytesPerRow = widthBlocks * info.blockSize;
+-    const uint64_t alignedBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
+-    if (heightBlocks != 0 && alignedBytesPerRow > UINT64_MAX / heightBlocks) {
++    const auto layout = mip_row_layout(texture, mip);
++    if (layout.rows != 0 && layout.budgetBytesPerRow > UINT64_MAX / layout.rows) {
+       return UINT64_MAX;
+     }
+-    const uint64_t mipBytes = alignedBytesPerRow * heightBlocks;
++    const uint64_t mipBytes = layout.budgetBytesPerRow * layout.rows;
+     if (mipBytes > UINT64_MAX - total) {
+       return UINT64_MAX;
+     }
+@@ -946,20 +993,20 @@
+   return total;
+ }
+ 
+-bool publish_fits_budget(uint64_t publishedCount, uint64_t publishedBytes, uint64_t nextBytes) noexcept {
+-  if (publishedCount == 0) {
+-    return true;
+-  }
+-  return nextBytes <= gx::texture::ReplacementPublishBudgetBytes &&
+-         publishedBytes <= gx::texture::ReplacementPublishBudgetBytes - nextBytes;
+-}
+-
+ std::string entry_path_for_log(const ReplacementEntry& entry) {
+   return entry.kind == EntryKind::Virtual ? entry.virtualPath : io::fs_path_to_string(entry.path);
+ }
+ 
++// Keeps the worst case texture_publish_stats reports per interval (called on frames that published,
++// from the presenting thread).
++void update_max(std::atomic<uint64_t>& target, uint64_t value) noexcept {
++  uint64_t current = target.load(std::memory_order_relaxed);
++  while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
++}
++
+ gfx::TextureHandle create_converted_texture_handle(const EntryLoadSnapshot& entry,
+-                                                   const gfx::ConvertedTexture& replacement) noexcept {
++                                                   const gfx::ConvertedTexture& replacement,
++                                                   bool upload = true) noexcept {
+   const auto label = entry.label.empty() ? fmt::format("TextureReplacement {}", entry.id) : entry.label;
+   const wgpu::Extent3D size{
+       .width = replacement.width,
+@@ -987,7 +1034,9 @@
+   auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
+                                                   replacement.format, replacement.mips, gfx::InvalidTextureFormat);
+   handle->isReplacement = true;
+-  aurora::gfx::write_texture(*handle, replacement.data);
++  if (upload) {
++    aurora::gfx::write_texture(*handle, replacement.data);
++  }
+   return handle;
+ }
+ 
+@@ -1040,6 +1089,7 @@
+     const uint64_t id = cache == s_cacheByKey.end() ? 0 : cache->second.id;
+     erase_cache_locked(key);
+     if (id != 0) {
++      s_replacementEvictions.fetch_add(1, std::memory_order_relaxed);
+       gx::texture::invalidate_replacement(id);
+       gx::texture::invalidate_bindings();
+     }
+@@ -1696,6 +1746,22 @@
+   }
+   return gfx::texture_replacement::has_replacement(*obj_);
+ }
++
++// 0248: for the port's [texpack] line (host thread); every value is an atomic the publishing thread
++// wrote, so no lock is taken here.
++TexturePublishStats texture_publish_stats() {
++  TexturePublishStats stats;
++  stats.completed = s_publishCompleted.load(std::memory_order_relaxed);
++  stats.publishedBytes = s_publishBytesTotal.load(std::memory_order_relaxed);
++  stats.deferredFrames = s_publishDeferredFrames.load(std::memory_order_relaxed);
++  stats.evictions = s_replacementEvictions.load(std::memory_order_relaxed);
++  stats.queued = s_publishQueued.load(std::memory_order_relaxed);
++  stats.inFlightBytes = s_publishInFlightBytes.load(std::memory_order_relaxed);
++  stats.worstFrameBytes = s_publishWorstFrameBytes.exchange(0, std::memory_order_relaxed);
++  stats.worstFrameMicros = s_publishWorstFrameMicros.exchange(0, std::memory_order_relaxed);
++  stats.budgetBytes = gx::texture::ReplacementPublishBudgetBytes;
++  return stats;
++}
+ } // namespace aurora::texture
+ 
+ namespace aurora::gfx::texture_replacement {
+@@ -1759,50 +1825,127 @@
+   }
+ 
+   StreamingStats stats;
+-  std::vector<LoadCompletion> deferred;
+-  for (auto& completion : s_readyPublishes) {
+-    bool selected = false;
++  const auto began = std::chrono::steady_clock::now();
++  uint64_t spent = 0;
++  bool deferred = false;
++  for (;;) {
++    const uint64_t budget = gx::texture::ReplacementPublishBudgetBytes;
++    if (!s_publish.has_value()) {
++      if (s_readyPublishes.empty() || spent >= budget) {
++        deferred = !s_readyPublishes.empty();
++        break;
++      }
++      auto completion = std::move(s_readyPublishes.front());
++      s_readyPublishes.pop_front();
++      bool selected = false;
++      {
++        std::lock_guard lock{s_registryMutex};
++        const auto* entry = find_selected_entry_locked(completion.entry.key);
++        selected = entry != nullptr && entry->id == completion.entry.id;
++        if (selected && !completion.texture.has_value()) {
++          s_failedIds.insert(completion.entry.id);
++        }
++      }
++      if (!selected || !completion.texture.has_value()) {
++        finish_full_load(completion.entry.id);
++        continue;
++      }
++      PendingPublish pending;
++      pending.entry = std::move(completion.entry);
++      pending.texture = std::move(*completion.texture);
++      pending.bytes = converted_upload_bytes(pending.texture);
++      s_publish = std::move(pending);
++    }
++
++    // A pack reloaded, reordered or switched off mid-publication: stop writing the old entry's rows
++    // (a part-written texture was never reachable from a draw).
++    bool stillSelected = false;
+     {
+       std::lock_guard lock{s_registryMutex};
+-      const auto* entry = find_selected_entry_locked(completion.entry.key);
+-      selected = entry != nullptr && entry->id == completion.entry.id;
+-      if (selected && !completion.texture.has_value()) {
+-        s_failedIds.insert(completion.entry.id);
+-      }
+-    }
+-    if (!selected || !completion.texture.has_value()) {
+-      finish_full_load(completion.entry.id);
++      const auto* entry = find_selected_entry_locked(s_publish->entry.key);
++      stillSelected = entry != nullptr && entry->id == s_publish->entry.id;
++    }
++    if (!stillSelected) {
++      finish_full_load(s_publish->entry.id);
++      s_publish.reset();
+       continue;
+     }
+ 
+-    const uint64_t bytes = converted_upload_bytes(*completion.texture);
+-    if (!publish_fits_budget(stats.publishes, stats.publishBytes, bytes)) {
+-      deferred.push_back(std::move(completion));
+-      continue;
+-    }
+-
+-    auto handle = create_converted_texture_handle(completion.entry, *completion.texture);
++    // The rest of the publication, as far as this frame's budget goes: whole row ranges, mip by mip.
++    while (s_publish->nextMip < s_publish->texture.mips) {
++      const auto layout = mip_row_layout(s_publish->texture, s_publish->nextMip);
++      if (layout.rows == 0 || layout.budgetBytesPerRow == 0) {
++        s_publish->nextMip += 1;
++        s_publish->nextRow = 0;
++        continue;
++      }
++      const uint64_t rowsLeft = budget > spent ? budget - spent : 0;
++      const uint64_t rowsFit = rowsLeft / layout.budgetBytesPerRow;
++      if (rowsFit == 0) {
++        // One row is at most maxTextureDimension2D * blockSize (64 KiB) against a 12 MiB budget, so
++        // the first row always fits; a later range waits for the next frame.
++        CHECK(s_publish->written != 0, "replacement publish: first row exceeds the frame budget");
++        deferred = true;
++        break;
++      }
++      const auto rows = static_cast<uint32_t>(std::min<uint64_t>(rowsFit, uint64_t{layout.rows} - s_publish->nextRow));
++      if (!s_publish->handle) {
++        // Created once, with the first row range: an allocation, not a cost that scales with the
++        // chain, and no draw can reach it until the last range is written.
++        s_publish->handle = create_converted_texture_handle(s_publish->entry, s_publish->texture, false);
++      }
++      gfx::write_texture_rows(*s_publish->handle, s_publish->texture.data.data() + s_publish->offset,
++                              s_publish->nextMip, s_publish->nextRow, rows);
++      spent += layout.budgetBytesPerRow * rows;
++      s_publish->written += layout.budgetBytesPerRow * rows;
++      s_publish->offset += layout.bytesPerRow * rows;
++      s_publish->nextRow += rows;
++      if (s_publish->nextRow == layout.rows) {
++        s_publish->nextMip += 1;
++        s_publish->nextRow = 0;
++      }
++    }
++    if (s_publish->nextMip < s_publish->texture.mips) {
++      break; // the budget is spent; the rest goes up next frame
++    }
++
++    auto pending = std::move(*s_publish);
++    s_publish.reset();
+     bool published = false;
+     {
+       std::lock_guard lock{s_registryMutex};
+-      const auto* entry = find_selected_entry_locked(completion.entry.key);
+-      if (entry != nullptr && entry->id == completion.entry.id) {
+-        cache_replacement_locked(completion.entry.key, completion.entry.id, handle, Tier::Full);
+-        s_failedIds.erase(completion.entry.id);
++      const auto* entry = find_selected_entry_locked(pending.entry.key);
++      if (entry != nullptr && entry->id == pending.entry.id) {
++        cache_replacement_locked(pending.entry.key, pending.entry.id, std::move(pending.handle), Tier::Full);
++        s_failedIds.erase(pending.entry.id);
+         published = true;
+       }
+     }
+-    finish_full_load(completion.entry.id);
++    finish_full_load(pending.entry.id);
+     if (!published) {
+       continue;
+     }
+ 
+-    gx::texture::invalidate_replacement(completion.entry.id);
++    gx::texture::invalidate_replacement(pending.entry.id);
+     gx::texture::invalidate_bindings();
+     ++stats.publishes;
+-    stats.publishBytes += bytes;
+-  }
+-  s_readyPublishes = std::move(deferred);
++    s_publishCompleted.fetch_add(1, std::memory_order_relaxed);
++  }
++  if (deferred) {
++    s_publishDeferredFrames.fetch_add(1, std::memory_order_relaxed);
++  }
++  stats.publishBytes = spent;
++  if (spent != 0) {
++    s_publishBytesTotal.fetch_add(spent, std::memory_order_relaxed);
++    const auto micros = static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
++    update_max(s_publishWorstFrameBytes, spent);
++    update_max(s_publishWorstFrameMicros, micros);
++    TracyPlot("aurora: textureReplacementPublishFrameBytes", static_cast<int64_t>(spent));
++  }
++  s_publishQueued.store(s_readyPublishes.size(), std::memory_order_relaxed);
++  s_publishInFlightBytes.store(s_publish.has_value() ? s_publish->bytes - s_publish->written : 0,
++                               std::memory_order_relaxed);
+   stats.pendingLoads = pending_full_load_count();
+   return stats;
+ }

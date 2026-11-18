@@ -27,7 +27,8 @@
 // Test aids: LM_TEXPACK_DIR=<dir> (packs folder), LM_TEXPACKS=0|1 (master switch),
 // LM_TEXDUMP=1|<dir> (dump from the start), LM_TEXPACK_AT=<frame>:<action>[,...][;...] (or '|') with
 // actions reload, on, off, dump, nodump, budget=<MB>, pack=<name>:<0|1>, top=<name> (guest frames),
-// LM_TEXPACK_LOG=<s> (stats line every s seconds, default 5 when set to 1).
+// LM_TEXPACK_LOG=<s> (the [mem] texture packs and [texpack] lines every s seconds, default 5 when set
+// to 1).
 #include "recomp/texture_packs.h"
 
 #include "port/install.h"
@@ -441,6 +442,29 @@ void memReport() {
         (unsigned long long)s.dumpQueued);
 }
 
+// LM_TEXPACK_LOG: publishing one interval of replacements (Aurora 0248). A decoded replacement goes
+// up on the presenting thread within a per-frame budget, a large one over several frames; the line
+// shows the budget holding and what the publishing cost.
+static void publishReport(double seconds) {
+    const auto s = aurora::texture::texture_publish_stats();
+    static uint64_t sPrevCompleted = 0, sPrevBytes = 0, sPrevDeferred = 0, sPrevEvictions = 0;
+    const uint64_t published = s.completed - sPrevCompleted;
+    const uint64_t bytes = s.publishedBytes - sPrevBytes;
+    const uint64_t deferred = s.deferredFrames - sPrevDeferred;
+    const uint64_t evicted = s.evictions - sPrevEvictions;
+    sPrevCompleted = s.completed;
+    sPrevBytes = s.publishedBytes;
+    sPrevDeferred = s.deferredFrames;
+    sPrevEvictions = s.evictions;
+    constexpr double kMb = 1024.0 * 1024.0;
+    const double span = std::max(seconds, 1e-3);
+    log("[texpack] %.1f s: %llu published, worst frame %.1f MB in %.1f ms, %llu frames over the %.0f MB budget, "
+        "%llu queued + %.1f MB in flight, %.1f MB published (%.1f MB/s), %llu evicted",
+        span, (unsigned long long)published, double(s.worstFrameBytes) / kMb, double(s.worstFrameMicros) / 1000.0,
+        (unsigned long long)deferred, double(s.budgetBytes) / kMb, (unsigned long long)s.queued,
+        double(s.inFlightBytes) / kMb, double(bytes) / kMb, double(bytes) / kMb / span, (unsigned long long)evicted);
+}
+
 void hostFrame() {
     if (!sInit) return;
     // LM_TEXPACK_LOG=<s>: the stats line every s seconds.
@@ -453,9 +477,12 @@ void hostFrame() {
     if (sLogEvery > 0) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point sLast = Clock::now();
-        if (std::chrono::duration<double>(Clock::now() - sLast).count() >= sLogEvery) {
-            sLast = Clock::now();
+        const Clock::time_point now = Clock::now();
+        const double elapsed = std::chrono::duration<double>(now - sLast).count();
+        if (elapsed >= sLogEvery) {
+            sLast = now;
             memReport();
+            publishReport(elapsed);
         }
     }
     // LM_TEXPACK_AT=<frame>:<action>[,<action>...][;<frame>:...] (see the top of the file).
