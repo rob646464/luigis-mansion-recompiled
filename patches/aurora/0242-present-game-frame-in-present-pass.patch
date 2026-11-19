@@ -1,0 +1,193 @@
+0242: Draw the game frame in the present pass instead of through a resample target
+
+The present path resampled the game frame into its own texture, then blitted that texture into the
+swap chain image one texel per pixel: `resample_present_source` (lib/webgpu/gpu.cpp) rendered a
+full-window pass into `g_resampledFrameBuffer` sized to the present viewport, and the present pass
+(lib/aurora.cpp) drew that texture with the copy pipeline over the same rectangle. Both rectangles
+are integral and the same size (`calculate_present_viewport` returns whole pixels, `viewport_extent`
+rounds the same float back), so the blit sampled every texel at its centre and wrote it unchanged: at
+the user's window, 7.06 Mpix and 28.2 MB each of read and write per frame, for a pass whose only
+product was the intermediate. With the CRT chain the resample is already skipped (postfx draws the
+game frame itself, gpu.cpp `postfx::prepare`); with the default `crt.enabled = false`
+(src/port/settings.h) every frame pays it.
+
+The present pass samples `present_source()` with the resampler pipeline
+(`webgpu::draw_present_source`): the same pipeline, sampler, uniforms and UVs the resample pass used,
+so the pixels written are the ones the resample pass produced. The area sampler derives its source
+box from the fragment's position in the target, and the target is the whole window rather than a
+viewport-sized texture, so the shader subtracts the viewport origin (new `frame_left`/`frame_top`
+uniforms). The removed second sampling was a 1:1 texel fetch (fp32 coordinate error ~1e-7 against
+the 0.002 step needed to change a byte). The RmlUi full-screen and CRT paths are untouched.
+
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -643,15 +643,9 @@
+ 
+     const bool canPresent = currentTexture && currentView;
+     if (canPresent) {
+-      wgpu::BindGroup presentBindGroup;
+-      // Post-process chain (if any) reads the game frame directly; the UI passes below stay unfiltered.
++      // Post-process chain (if any) reads the game frame directly; the game frame and the UI stay
++      // unfiltered.
+       const bool postfx = !(rmlBindGroup && !rmlOverlay) && webgpu::postfx::prepare(encoder, viewport);
+-      if (rmlBindGroup && !rmlOverlay) {
+-        presentBindGroup = rmlBindGroup;
+-      } else if (!postfx) {
+-        const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
+-        presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
+-      }
+       {
+         const std::array attachments{
+             wgpu::RenderPassColorAttachment{
+@@ -670,12 +664,15 @@
+         // Copy EFB -> XFB (swapchain)
+         set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                              webgpu::g_graphicsConfig.surfaceConfiguration.height);
+-        if (postfx) {
+-          webgpu::postfx::draw(pass);
+-        } else {
++        if (rmlBindGroup && !rmlOverlay) {
+           pass.SetPipeline(webgpu::g_CopyPipeline);
+-          pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
++          pass.SetBindGroup(0, rmlBindGroup, 0, nullptr);
+           pass.Draw(3);
++        } else if (postfx) {
++          webgpu::postfx::draw(pass);
++        } else {
++          // 0242: the game frame is resampled straight into this pass, with no intermediate target.
++          webgpu::draw_present_source(pass, viewport);
+         }
+         if (rmlBindGroup && rmlOverlay) {
+           pass.SetPipeline(webgpu::g_CopyPremultipliedAlphaPipeline);
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -80,7 +80,6 @@
+ static wgpu::BindGroupLayout g_ResampleBindGroupLayout;
+ static wgpu::RenderPipeline g_ResamplePipeline;
+ static wgpu::Buffer g_ResampleUniformBuffer;
+-static TextureWithSampler g_resampledFrameBuffer;
+ 
+ static wgpu::Adapter g_adapter;
+ wgpu::Instance g_instance;
+@@ -122,6 +121,10 @@
+   uint32_t samplerMode = 0;
+   float frameWidth = 0.f;
+   float frameHeight = 0.f;
++  // 0242: the present viewport's top-left corner in the swap chain texture. The pass covers the whole
++  // window, so the area sampler needs the fragment's position relative to the viewport.
++  float frameLeft = 0.f;
++  float frameTop = 0.f;
+ };
+ 
+ constexpr std::string_view resampleShaderSource = R"(
+@@ -129,6 +133,8 @@
+     sampler_mode: u32,
+     frame_width: f32,
+     frame_height: f32,
++    frame_left: f32,
++    frame_top: f32,
+ };
+ 
+ struct VertexOutput {
+@@ -168,13 +174,13 @@
+     return textureLoad(t, coord, 0);
+ }
+ 
+-fn sample_area(frag_position: vec4<f32>) -> vec4<f32> {
++fn sample_area(frag_position: vec2<f32>) -> vec4<f32> {
+     let source_size = vec2<f32>(textureDimensions(t));
+     let target_size = max(vec2<f32>(uniforms.frame_width, uniforms.frame_height), vec2<f32>(1.0, 1.0));
+ 
+-    let source_min = clamp((frag_position.xy - vec2<f32>(0.5, 0.5)) / target_size,
++    let source_min = clamp((frag_position - vec2<f32>(0.5, 0.5)) / target_size,
+                            vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
+-    let source_max = clamp((frag_position.xy + vec2<f32>(0.5, 0.5)) / target_size,
++    let source_max = clamp((frag_position + vec2<f32>(0.5, 0.5)) / target_size,
+                            vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
+ 
+     let first_pixel = vec2<i32>(floor(source_min));
+@@ -212,7 +218,7 @@
+ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+     var color = textureSample(t, s, in.uv);
+     if (uniforms.sampler_mode == 1u) {
+-        color = sample_area(in.position);
++        color = sample_area(in.position.xy - vec2<f32>(uniforms.frame_left, uniforms.frame_top));
+     }
+     return vec4(color.rgb, 1.0);
+ }
+@@ -696,21 +702,19 @@
+   return g_device.CreateBindGroup(&bindGroupDescriptor);
+ }
+ 
+-const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport) {
++void draw_present_source(const wgpu::RenderPassEncoder& pass, const Viewport& viewport) {
+   const auto& source = present_source();
+   const uint32_t width = viewport_extent(viewport.width);
+   const uint32_t height = viewport_extent(viewport.height);
+-  if (!g_resampledFrameBuffer.view || g_resampledFrameBuffer.size.width != width ||
+-      g_resampledFrameBuffer.size.height != height || g_resampledFrameBuffer.format != source.format) {
+-    g_resampledFrameBuffer = create_render_texture(width, height, false);
+-  }
+ 
+   const ResampleUniformBlock uniform{
+       .samplerMode = sampler_mode(g_Resampler),
+       .frameWidth = static_cast<float>(width),
+       .frameHeight = static_cast<float>(height),
++      .frameLeft = viewport.left,
++      .frameTop = viewport.top,
+   };
+-  AURORA_ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
++  AURORA_ASSERT(gfx::render_worker::is_worker_thread(), "Present draw queue write must run on the render worker");
+   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
+ 
+   const std::array bindGroupEntries{
+@@ -735,27 +739,9 @@
+   };
+   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+ 
+-  const std::array attachments{
+-      wgpu::RenderPassColorAttachment{
+-          .view = g_resampledFrameBuffer.view,
+-          .loadOp = wgpu::LoadOp::Clear,
+-          .storeOp = wgpu::StoreOp::Store,
+-      },
+-  };
+-  const wgpu::RenderPassDescriptor renderPassDescriptor{
+-      .label = "Present resample render pass",
+-      .colorAttachmentCount = attachments.size(),
+-      .colorAttachments = attachments.data(),
+-      .timestampWrites = gpu_prof::pass_writes("Present resample"),
+-  };
+-  const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
+   pass.SetPipeline(g_ResamplePipeline);
+   pass.SetBindGroup(0, bindGroup, 0, nullptr);
+-  pass.SetViewport(0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f);
+   pass.Draw(3);
+-  pass.End();
+-
+-  return g_resampledFrameBuffer;
+ }
+ 
+ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
+@@ -1231,7 +1217,6 @@
+   g_ResampleBindGroupLayout = {};
+   g_ResamplePipeline = {};
+   g_ResampleUniformBuffer = {};
+-  g_resampledFrameBuffer = {};
+   g_frameBuffer = {};
+   g_frameBufferResolved = {};
+   g_depthBuffer = {};
+--- a/lib/webgpu/gpu.hpp
++++ b/lib/webgpu/gpu.hpp
+@@ -80,7 +80,10 @@
+ AuroraSampler get_resampler() noexcept;
+ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
+                                     uint32_t content_height) noexcept;
+-const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport);
++// 0242: draws the game frame (present_source) into the present pass at `viewport`, with the selected
++// resampler; the caller has set the pass's viewport and scissor to it (aurora.cpp's
++// set_present_viewport).
++void draw_present_source(const wgpu::RenderPassEncoder& pass, const Viewport& viewport);
+ void draw_clear(const wgpu::RenderPassEncoder& pass, bool clearColor, bool clearAlpha, bool clearDepth,
+                 const Vec4<float>& clearColorValue, float clearDepthValue);
+ 

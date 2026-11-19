@@ -1,0 +1,237 @@
+0243: Quantize the EFB for its copy only, and don't store colour that is overwritten unseen
+
+The 6-bit blend resolve (0176) and the shadow-map caster pass both touch a full target worth of
+pixels that nothing ever reads. Three amounts of work are dropped, pixel for pixel:
+
+1. The quantize pass's LoadOp was Load (lib/gfx/efb_blend6.cpp, `runPass`). Its fragment shader is
+   a full-screen triangle whose output covers every pixel and every sample of the attachment, so
+   the load read a full target (7.06 MB at the user's 1680x1050) into tile memory to overwrite all
+   of it. It is Clear now, in all three uses: the single-sampled quantize, the multisampled
+   quantize, and the multisampled store.
+
+2. A pass whose own colour copy is the last reader of its colour: the copy is a GXCopyTex over
+   the whole target with clear, so the pass right after it clears the colour completely (0212
+   already drops the resolve for exactly this case when the copy is a depth copy). The pixels then
+   only have to reach the copy, so the resolve quantizes the colour straight into its scratch and
+   the copy reads it from there (`efb_blend6::copy_source_over`, used by lib/gfx/encoding.cpp).
+   That removes a full-target texture copy (read+write of the target) and the quantized copy back
+   (load+read+store), which nothing would see: per resolve at 1680x1050, 35.3 MB before
+   (copy 14.1 + load 7.06 + sample 7.06 + store 7.06), 14.1 MB after. Pixels outside the copy
+   rectangle keep their unquantized values instead of being rewritten quantized; the next pass
+   clears them without reading.
+
+3. The same knowledge lets the shadow-map caster pass skip its colour store
+   (lib/gfx/recording.cpp `resolve_pass_into`): its copy is a Z16 depth copy, the pass after it
+   clears the colour completely, and no snapshot or scene post-op reads it, so its colour target is
+   stored (7.06 MB) and never read. `StoreOp::Discard`. Gated off for multisampled targets (their
+   resolve view is stored as well) and for offscreen passes.
+
+At 4.4 resolves per frame the profile measured 6.222 ms for "EFB blend6 quantize"; the load
+removal is 20% of a resolve's traffic and the scratch handoff 60% for the resolves that a clearing
+copy ends (three of the four per frame in an ordinary room: the Z16 shadow copy is already dropped
+by 0212). Expected 2.5-4 ms per frame. `AURORA_EFB_BLEND6_NODEFER=1` and the timing aid
+`AURORA_EFB_BLEND6_TIMING=1` stay valid A/B switches; the "EFB blend6 copy" zone disappears for the
+handoff resolves.
+
+--- a/lib/gfx/efb_blend6.cpp
++++ b/lib/gfx/efb_blend6.cpp
+@@ -1,4 +1,6 @@
+ #include "efb_blend6.hpp"
++
++#include "../internal.hpp"
+ 
+ #include "frame_packet.hpp"
+ #include "../gx/gx.hpp"
+@@ -139,7 +141,7 @@
+       g_scratch.format != format || g_scratch.samples != samples) {
+     const wgpu::TextureDescriptor desc{
+         .label = "EFB blend6 scratch",
+-        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
++        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc |
+                  (samples == 1 ? wgpu::TextureUsage::CopyDst : wgpu::TextureUsage::None),
+         .dimension = wgpu::TextureDimension::e2D,
+         .size = {size.width, size.height, 1},
+@@ -236,6 +238,14 @@
+   uint8_t flags = 0;
+ };
+ Pending g_pending;
++// 0243: the scratch holding a pass's quantized color when the resolve wrote it there for the
++// pass's own copy to read, instead of copying it back into the color target.
++struct Handoff {
++  WGPUTextureView color = nullptr;
++  wgpu::TextureView view;
++  wgpu::Texture texture;
++};
++Handoff g_handoff;
+ // 0212: the last pass's resolve, run (or dropped) at the next op (before_op).
+ struct Deferred {
+   const detail::RenderPass* pass = nullptr;
+@@ -246,7 +256,20 @@
+ void resolve(const wgpu::CommandEncoder& cmd, detail::FramePacket& frame, const detail::RenderPass& pass, uint8_t flags);
+ } // namespace
+ 
++QuantizedSource copy_source_over(const detail::RenderPass& pass) noexcept {
++  const auto taken = std::exchange(g_handoff, Handoff{});
++  if (taken.color == nullptr || pass.colorAttachmentCount == 0 ||
++      taken.color != pass.colorAttachments[SceneColorAttachmentIndex].view.Get()) {
++    return {};
++  }
++  return {.view = std::move(taken.view), .texture = std::move(taken.texture)};
++}
++
+ void after_pass(const wgpu::CommandEncoder& cmd, detail::FramePacket& frame, const detail::RenderPass& pass) {
++  // 0243: a handoff nobody consumed means the copy that should have read the quantized pixels ran
++  // after another pass's resolve; the copy would sample the unquantized colour with no error.
++  CHECK(g_handoff.color == nullptr, "efb_blend6: quantized handoff not consumed by the copy");
++  g_handoff = {};
+   if (pass.colorAttachmentCount == 0) {
+     return;
+   }
+@@ -304,10 +327,12 @@
+ 
+   const auto runPass = [&](const char* label, const wgpu::TextureView& target, const wgpu::TextureView& resolveTarget,
+                            const Pipeline& p, const wgpu::TextureView& src, const wgpu::PassTimestampWrites* writes) {
++    // 0243: the full-screen triangle covers every pixel and sample of the attachment, so nothing
++    // reads what it held before: Clear instead of a Load that fetches the whole target.
+     const wgpu::RenderPassColorAttachment att{
+         .view = target,
+         .resolveTarget = resolveTarget,
+-        .loadOp = wgpu::LoadOp::Load,
++        .loadOp = wgpu::LoadOp::Clear,
+         .storeOp = wgpu::StoreOp::Store,
+     };
+     const wgpu::RenderPassDescriptor desc{
+@@ -322,7 +347,18 @@
+     rp.Draw(3);
+     rp.End();
+   };
+-  if (samples == 1 && pass.copySourceTexture && pass.copySourceView.Get() == color.view.Get()) {
++  const bool readsColorInPlace =
++      samples == 1 && pass.copySourceTexture && pass.copySourceView.Get() == color.view.Get();
++  if (readsColorInPlace && pass.colorClearedAfter) {
++    // 0243: this pass's own copy is the last reader of its color (the next pass clears the target
++    // completely), so the quantized pixels only have to reach that copy: quantize into the scratch
++    // and let the copy read it, skipping the target->scratch copy and the quantized copy back.
++    if (timing) {
++      tw[0].endOfPassWriteIndex = 1;
++    }
++    runPass("EFB blend6 quantize", scratch.view, {}, quantize, color.view, timing ? &tw[0] : nullptr);
++    g_handoff = {.color = color.view.Get(), .view = scratch.view, .texture = scratch.texture};
++  } else if (readsColorInPlace) {
+     // Single-sampled target: a plain texture copy into the scratch, then one quantizing pass back.
+     const wgpu::TexelCopyTextureInfo src{.texture = pass.copySourceTexture};
+     const wgpu::TexelCopyTextureInfo dst{.texture = scratch.texture};
+--- a/lib/gfx/efb_blend6.hpp
++++ b/lib/gfx/efb_blend6.hpp
+@@ -27,6 +27,14 @@
+ // what is left at the end of the frame.
+ void before_op(const wgpu::CommandEncoder& cmd, detail::FramePacket& frame, const detail::RenderPass* next);
+ void flush(const wgpu::CommandEncoder& cmd, detail::FramePacket& frame);
++// 0243: where a pass's own color copy has to read the quantized pixels from, when after_pass left
++// them in the resolve scratch (the pass's color is cleared unseen by the next one). Empty
++// otherwise. Answers once, for the pass it was prepared for; render worker only.
++struct QuantizedSource {
++  wgpu::TextureView view;    // sampled by a conversion or filtered copy
++  wgpu::Texture texture;     // read by a plain texture-to-texture copy
++};
++QuantizedSource copy_source_over(const detail::RenderPass& pass) noexcept;
+ void initialize();
+ void shutdown();
+ 
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -281,11 +281,16 @@
+     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
+                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
+     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
++    // 0243: the resolve above may have left the quantized color in its scratch, when this copy is
++    // the last reader of the pass's color target; the copy reads it from there.
++    const auto quantized = efb_blend6::copy_source_over(passInfo);
++    const bool readQuantized = !isDepth && (quantized.view || quantized.texture);
+     // Depth copies from a multisampled EFB read sample 0 (tex_copy_conv's MS depth pipelines).
+     const tex_copy_conv::ConvRequest convReq{
+         .fmt = passInfo.resolveFormat,
+         .srcFmt = passInfo.resolveSourceFormat,
+-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
++        .srcView = isDepth ? passInfo.copySourceDepthView
++                           : (readQuantized ? quantized.view : passInfo.copySourceView),
+         .uniformRange = passInfo.resolveUniformRange,
+         .dst = passInfo.resolveTarget,
+         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+@@ -301,7 +306,7 @@
+     } else {
+       const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
+       const wgpu::TexelCopyTextureInfo src{
+-          .texture = passInfo.copySourceTexture,
++          .texture = readQuantized ? quantized.texture : passInfo.copySourceTexture,
+           .origin =
+               wgpu::Origin3D{
+                   .x = static_cast<uint32_t>(passInfo.resolveRect.x),
+--- a/lib/gfx/frame_packet.hpp
++++ b/lib/gfx/frame_packet.hpp
+@@ -115,6 +115,9 @@
+   // 0212: a post-op reads this pass's color target (push_scene_op); EFB-copy RAM ops only read
+   // their copy textures.
+   bool colorPostOps = false;
++  // 0243: the pass right after this one clears its color target completely (a GXCopyTex with clear
++  // over the whole target), so nothing but this pass's own copy ever reads its color.
++  bool colorClearedAfter = false;
+   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
+   std::vector<efb_ram::PassOp> ramPreOps;  // before the pass (EFB copy RAM decodes)
+   std::vector<efb_ram::PassOp> ramPostOps; // after the resolve (EFB copy RAM encode/readback)
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -459,6 +459,7 @@
+   for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
+     newPass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
+     newPass.colorAttachments[i].clear = false;
++    newPass.colorAttachments[i].storeOp = wgpu::StoreOp::Store; // 0243: not the pass it came from
+   }
+   newPass.commands.reserve(2048);
+   current_render_passes().emplace_back(std::move(newPass));
+@@ -937,10 +938,6 @@
+     prevPass.ramPostOps.push_back(std::move(g_nextResolveOp));
+     g_nextResolveOp = {};
+   }
+-  enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+-
+-  // Populate new render pass from previous
+-  const auto msaaSamples = prevPass.msaaSamples;
+   const auto& targetSize = prevPass.colorAttachments[SceneColorAttachmentIndex].size;
+   const auto left = std::clamp<int32_t>(rect.x, 0, static_cast<int32_t>(targetSize.width));
+   const auto top = std::clamp<int32_t>(rect.y, 0, static_cast<int32_t>(targetSize.height));
+@@ -948,6 +945,21 @@
+   const auto bottom = std::clamp<int32_t>(rect.y + rect.height, top, static_cast<int32_t>(targetSize.height));
+   const ClipRect clearRect{.x = left, .y = top, .width = right - left, .height = bottom - top};
+   const bool fullTarget = left == 0 && top == 0 && right == targetSize.width && bottom == targetSize.height;
++  const bool fullColorClear = clearColor && clearAlpha && fullTarget;
++  // 0243: the continuation pass clears this pass's color completely, so its own copy (if it is a
++  // color copy) is the only reader left, and when the copy reads depth, nothing reads the color
++  // at all (0212 drops its 6-bit resolve for the same reason).
++  const bool colorClearedAfter = fullColorClear && !g_recorder.inOffscreen && !prevPass.snapshotColorDst &&
++                                 !prevPass.colorPostOps;
++  prevPass.colorClearedAfter = colorClearedAfter;
++  if (colorClearedAfter && !prevPass.colorAttachments[SceneColorAttachmentIndex].resolveView &&
++      gx::is_depth_format(prevPass.resolveFormat)) {
++    prevPass.colorAttachments[SceneColorAttachmentIndex].storeOp = wgpu::StoreOp::Discard;
++  }
++  enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
++
++  // Populate new render pass from previous
++  const auto msaaSamples = prevPass.msaaSamples;
+   if ((clearColor || clearDepth) && !g_recorder.inOffscreen) {
+     enhanced::efb_cleared(float(clearRect.width) * float(clearRect.height) /
+                               std::max(float(targetSize.width) * float(targetSize.height), 1.f),
+@@ -969,10 +981,11 @@
+       .hasDepth = prevPass.hasDepth,
+       .hasStencil = prevPass.hasStencil,
+   };
+-  const bool fullColorClear = clearColor && clearAlpha && fullTarget;
+   for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
+     auto& color = newPass.colorAttachments[i];
+     color.loadOp = wgpu::LoadOp::Undefined;
++    // 0243: the attachments are the previous pass's; its store choice was for its own end.
++    color.storeOp = wgpu::StoreOp::Store;
+     if (color.semantic == ColorAttachmentSemantic::Normal && clearDepth && fullTarget) {
+       color.clear = true;
+     } else {

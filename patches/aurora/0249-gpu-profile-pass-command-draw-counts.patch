@@ -1,0 +1,80 @@
+0249: count encoded passes, commands and draws per frame in the GPU profile
+
+The AURORA_GPU_PROFILE text line reported GPU ms per pass and a per-frame "xN" count per pass, but no
+totals, so a change that removed passes or draws had no number to prove it. The line ends with
+", passes/frame N, commands/frame N, draws/frame N", accumulated only while the text profile is on:
+counts_enabled() is one predictable branch per encoded GX pass otherwise, and the per-pass command
+walk only runs inside it. The pass is encoded exactly as before; only counters are incremented.
+
+--- a/lib/webgpu/gpu_prof.hpp
++++ b/lib/webgpu/gpu_prof.hpp
+@@ -14,6 +14,10 @@
+ void frame_begin(const wgpu::CommandEncoder& encoder);
+ void frame_end(const wgpu::CommandEncoder& encoder);
+ void after_submit();
++// 0249: counts for a frame's encoded GX passes, commands and draws, printed by the AURORA_GPU_PROFILE
++// text line, so a change in passes/draws per frame can be proven. Free with the text profile off.
++bool counts_enabled();
++void note_encoded_pass(uint32_t commands, uint32_t draws);
+ const wgpu::PassTimestampWrites* pass_writes(std::string_view name);
+ 
+ class Zone {
+--- a/lib/webgpu/gpu_prof.cpp
++++ b/lib/webgpu/gpu_prof.cpp
+@@ -141,6 +141,7 @@
+ double g_busyNs = 0;
+ double g_spanNs = 0;
+ uint64_t g_frames = 0;
++uint64_t g_passes = 0, g_commands = 0, g_draws = 0;  // 0249: encoded pass/command/draw counts
+ int64_t g_windowStartNs = 0;
+ 
+ std::string group_of(const char* name) {
+@@ -170,6 +171,9 @@
+                                 "(= {:.0f}% of wall time), span {:.3f} ms/frame",
+                                 g_frames, secs, double(g_frames) / secs, g_busyNs * perFrame,
+                                 100.0 * g_busyNs * 1e-9 / secs, g_spanNs * perFrame);
++  out += fmt::format(", passes/frame {:.1f}, commands/frame {:.0f}, draws/frame {:.0f}",
++                     double(g_passes) / double(g_frames), double(g_commands) / double(g_frames),
++                     double(g_draws) / double(g_frames));
+   for (const auto& r : rows) {
+     out += "\n  ";
+     out += r.second;
+@@ -186,6 +190,7 @@
+   Log.info("{}", out);
+   g_byGroup.clear();
+   g_byLabel.clear();
++  g_passes = g_commands = g_draws = 0;
+   g_busyNs = 0;
+   g_spanNs = 0;
+   g_frames = 0;
+@@ -490,6 +495,14 @@
+   g_framePending = false;
+ }
+ 
++bool counts_enabled() { return text_profile_requested() && g_frameActive; }
++
++void note_encoded_pass(uint32_t commands, uint32_t draws) {
++  g_passes += 1;
++  g_commands += commands;
++  g_draws += draws;
++}
++
+ void frame_begin(const wgpu::CommandEncoder& encoder) {
+   if (!g_enabled) {
+     return;
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -265,6 +265,13 @@
+ 
+   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+   render_pass(pass, frame, passInfo);
++  if (webgpu::gpu_prof::counts_enabled()) {
++    uint32_t draws = 0;
++    for (const auto& command : passInfo.commands) {
++      draws += command.type == CommandType::Draw || command.type == CommandType::CustomDraw ? 1u : 0u;
++    }
++    webgpu::gpu_prof::note_encoded_pass(static_cast<uint32_t>(passInfo.commands.size()), draws);
++  }
+   pass.End();
+ 
+   // 0176: RGBA6 blend results stored as 6-bit values before anything reads the target.
