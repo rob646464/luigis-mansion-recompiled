@@ -1,0 +1,73 @@
+0241: One thread_local for the FIFO recording target
+
+detail::recording() read two thread_locals (tJoinedRecording, then tOwnRecording) and the guest's FIFO
+write path calls it once per GX word: hle_gx.cpp rawFifoWrite -> GXCmd1u8/16/32 -> write_data. In a
+PIC build each of those reads is a call into dyld; `_tlv_get_addr` was 4.4 % of the guest thread's
+samples in a macOS `sample` profile of the port (69 of the thread's 107 such samples), in both
+presentation modes.
+
+The two variables are one thread_local object, tRecording, so recording() does one lookup:
+tRecording.own is the thread's own recording and tRecording.joined what join_recording (0235) sets.
+An initial-exec model would remove the lookup, but Darwin has only the TLV model (clang emits the TLV
+bootstrap call for tls_model("initial-exec") too); hoisting the pointer out of a batch belongs in the
+port's per-word write path.
+
+--- a/lib/gx/fifo.hpp
++++ b/lib/gx/fifo.hpp
+@@ -20,11 +20,17 @@
+   uint32_t size = 0;
+   uint32_t pos = 0;
+ };
+-extern thread_local Recording tOwnRecording;
+-extern thread_local Recording* tJoinedRecording;
++// 0241: one thread_local so recording(), which the guest write path calls once per GX word
++// (lib/dolphin/gx/GXVert.cpp GXCmd1u8/16/32), is one dyld lookup (_tlv_get_addr) instead of two:
++// 4.4 % of the guest thread's samples in a macOS `sample` profile.
++struct ThreadRecording {
++  Recording own;
++  Recording* joined = nullptr; // 0235: the recording another thread began, while this thread joins it
++};
++extern thread_local ThreadRecording tRecording;
+ inline Recording& recording() noexcept {
+-  Recording* joined = tJoinedRecording;
+-  return joined != nullptr ? *joined : tOwnRecording;
++  auto& t = tRecording;
++  return t.joined != nullptr ? *t.joined : t.own;
+ }
+ } // namespace detail
+ 
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -20,8 +20,7 @@
+ uint8_t* sBufferData = nullptr;
+ uint32_t sBufferSize = 0;
+ uint32_t sBufferCapacity = 0;
+-thread_local Recording tOwnRecording;
+-thread_local Recording* tJoinedRecording = nullptr;
++thread_local ThreadRecording tRecording;
+ } // namespace detail
+ 
+ namespace {
+@@ -237,7 +236,7 @@
+   rec.buffer = buf;
+   rec.size = size;
+   rec.pos = 0;
+-  if (detail::tJoinedRecording == nullptr) {
++  if (detail::tRecording.joined == nullptr) {
+     sLastRecording.store(&rec, std::memory_order_release);
+   }
+ }
+@@ -262,11 +261,11 @@
+ 
+ void join_recording(bool join) {
+   if (!join) {
+-    detail::tJoinedRecording = nullptr;
++    detail::tRecording.joined = nullptr;
+     return;
+   }
+   auto* last = sLastRecording.load(std::memory_order_acquire);
+-  detail::tJoinedRecording = last == &detail::tOwnRecording ? nullptr : last;
++  detail::tRecording.joined = last == &detail::tRecording.own ? nullptr : last;
+ }
+ 
+ bool in_display_list() { return detail::recording().active; }

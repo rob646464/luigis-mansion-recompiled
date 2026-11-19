@@ -1,0 +1,172 @@
+0244: texture cache: visit expired entries by due frame instead of walking the object cache every frame
+
+aurora_end_frame -> gx::texture::end_frame -> sweep_object_caches walked all of
+s_textureObjectCaches on the host thread, every frame, after gx::fifo::drain() and immediately
+before gfx::finish(). Nothing overlaps it and it waits on nothing, so it is serial CPU time on the
+frame critical path: 305 of 2442 main-thread samples (12.5 %) in a `sample` of the playtest build
+on a base M1, macOS 26.6, i.e. about 2.3 ms of an 18.2 ms host frame against a 16.7
+ms period (interp replay 2.9 + fifo drain 12.9 + this 2.35 + finish 0.4). The table is not small:
+the port's [mem] lines report 143 962 to 154 910 texture-object entries (x2_keep_on.log, 60/120/180
+s), 48 bytes each.
+
+The walk cannot just be sliced with a cursor. s_textureObjectCaches is an absl::flat_hash_map,
+whose iterators are invalidated by any insert that grows the table and by clear(); re-seeking by
+index each frame costs the prefix it skips, so past the middle of the table it costs more than the
+whole walk; and erase moves a neighbouring element into the freed slot, so even the surviving
+elements' positions are not stable. What is stable is the predicate's input: lastUsedFrame only
+moves forward, and with s_frameCount incremented just before the sweep, expired() (s_frameCount -
+lastUsedFrame > 600) first holds on the frame lastUsedFrame + 601. So each entry is visited when it
+is due rather than when it is walked:
+
+* CachedTextureEntry carries the frame its check is due (sweepFrame, in the padding before
+  replacementId).
+* s_objectCacheSweepQueue is a ring of 1024 due-frame buckets of texObjIds, larger than the
+  601-frame deadline, so a ticket always lands on a frame that has not been processed yet. A ticket
+  is queued when an entry is created (store_cached_texture, the only insert path) and again by the
+  visit itself when the entry turned out to still be in use; one whose id another path already
+  evicted, or that is older than the entry now cached under the same id, finds nothing and is
+  dropped. The queue is cleared wherever the map is cleared.
+* sweep_object_caches swaps out one bucket and runs find + the unchanged expired() predicate
+  against the live lastUsedFrame, so an entry is evicted on exactly the frame the every-frame walk
+  would have evicted it: retention and the [mem] "texture objects" curve are unchanged, and no
+  pixel can change (eviction here is only memory reclamation).
+
+Per-frame work is now proportional to the entries whose idle window expires on that frame (about
+260 tickets per frame at 155k entries and a 601-frame window, one find and one comparison each)
+instead of to the table size; the pathological case, every entry due at once, costs the old
+per-frame price once. The queue holds one u32 per cached entry, about 620 KB at 155k entries.
+
+Verification: `sample` on the same route, texture::end_frame must leave the main-thread stack (305
+samples -> ~0) and [perf] host median must drop by about 2.3 ms when present timing is on; the
+[mem] "texture objects" curve must stay where it is and still plateau (10 145 / 76 986 / 154 910 at
+60/120/180 s). A texture-heavy route walked twice, or the model viewer, is the check that nothing
+is kept alive: a ticket that never fires shows up as [mem] texture objects that stop plateauing.
+
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -12,6 +12,7 @@
+ #include <xxhash.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+@@ -19,6 +20,7 @@
+ #include <list>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ namespace aurora::gx {
+ namespace {
+@@ -49,6 +51,10 @@
+   u32 texDataVersion = 0;
+   u32 tlutObjId = 0;
+   u32 tlutDataVersion = 0;
++  // 0244: the frame this entry's sweep ticket is due for (sweep_object_caches), instead of the
++  // entry being checked on every frame. Fits in the padding before replacementId, so the entry
++  // stays 48 bytes.
++  u32 sweepFrame = 0;
+   uint64_t replacementId = 0;
+   uint64_t lastUsedFrame = 0;
+ };
+@@ -130,6 +136,23 @@
+ std::atomic<uint64_t> s_pendingCacheClears = 0;
+ TextureStats s_stats;
+ 
++// 0244: eviction tickets for s_textureObjectCaches, see sweep_object_caches: the texObjId to visit
++// at a frame, in that frame's bucket. Every entry has exactly one ticket pending, due when its idle
++// timeout first expires it (lastUsedFrame + ObjectCacheIdleFrames + 1). The ring is longer than
++// that distance, so a ticket always lands in a bucket that has not been processed yet, and
++// end_frame increments s_frameCount on the line before the sweep without an early exit, so each
++// frame's bucket is processed exactly once.
++constexpr uint32_t ObjectCacheSweepRingSize = 1024;
++constexpr uint64_t ObjectCacheSweepDeadlineFrames = texture::ObjectCacheIdleFrames + 1;
++std::array<std::vector<u32>, ObjectCacheSweepRingSize> s_objectCacheSweepQueue;
++
++// Queued where an entry is created (store_cached_texture) and when a due entry is still in use; a
++// new insert path into s_textureObjectCaches must queue here too, or that entry is never swept.
++void queue_object_cache_sweep(u32 texObjId, CachedTextureEntry& entry) {
++  entry.sweepFrame = static_cast<u32>(entry.lastUsedFrame + ObjectCacheSweepDeadlineFrames);
++  s_objectCacheSweepQueue[entry.sweepFrame % ObjectCacheSweepRingSize].push_back(texObjId);
++}
++
+ #if DEBUG
+ constexpr bool BuildSourceKeyForDebug = true;
+ #else
+@@ -140,6 +163,7 @@
+ 
+ void do_clear_static_texture_cache() noexcept {
+   s_textureObjectCaches.clear();
++  s_objectCacheSweepQueue = {};
+   s_replacementUsers.clear();
+   for (auto& [_, cache] : s_tlutObjectCaches) {
+     cache.staticTextureUsers.clear();
+@@ -200,7 +224,8 @@
+     return;
+   }
+ 
+-  auto& entry = s_textureObjectCaches[obj.texObjId];
++  auto [entryIt, inserted] = s_textureObjectCaches.try_emplace(obj.texObjId);
++  auto& entry = entryIt->second;
+   if (entry.tlutObjId != tlutObjId || entry.replacementId != replacementId) {
+     clear_texture_dependency(obj.texObjId, entry);
+   }
+@@ -211,6 +236,11 @@
+   entry.tlutDataVersion = tlutDataVersion;
+   entry.replacementId = replacementId;
+   entry.lastUsedFrame = s_frameCount;
++  if (inserted) {
++    // 0244: a new entry is only ever looked at again through its sweep ticket. A re-store of an
++    // existing entry keeps its pending ticket, which re-reads lastUsedFrame when it comes due.
++    queue_object_cache_sweep(obj.texObjId, entry);
++  }
+ 
+   if (tlutObjId != 0) {
+     auto& cache = s_tlutObjectCaches[tlutObjId];
+@@ -470,14 +500,29 @@
+     return s_frameCount > lastUsedFrame && s_frameCount - lastUsedFrame > texture::ObjectCacheIdleFrames;
+   };
+ 
+-  for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
+-    if (expired(it->second.lastUsedFrame)) {
+-      const u32 texObjId = it->first;
+-      const CachedTextureEntry entry = it->second;
+-      s_textureObjectCaches.erase(it++);
+-      clear_texture_dependency(texObjId, entry);
++  // 0244: this used to walk all of s_textureObjectCaches every frame: 143 962 to 154 910 entries
++  // ([mem] "texture objects") at 2.3 ms of host time per presented frame on a base M1, 305 of 2442
++  // main-thread samples inside texture::end_frame after gx::fifo::drain and before gfx::finish, so
++  // nothing overlaps it. absl iterators do not survive an insert that grows the table, so each
++  // entry carries the frame its check is due instead.
++  static std::vector<u32> dueTickets;
++  dueTickets.clear();
++  dueTickets.swap(s_objectCacheSweepQueue[s_frameCount % ObjectCacheSweepRingSize]);
++  for (const u32 texObjId : dueTickets) {
++    const auto it = s_textureObjectCaches.find(texObjId);
++    if (it == s_textureObjectCaches.end()) {
++      continue; // Already gone: evict_texture_object, invalidate_replacement, a TLUT reload or clear.
++    }
++    auto& entry = it->second;
++    // A duplicate or late ticket is harmless: find + expired + re-queue is idempotent.
++    if (expired(entry.lastUsedFrame)) {
++      const CachedTextureEntry evicted = entry;
++      s_textureObjectCaches.erase(it);
++      clear_texture_dependency(texObjId, evicted);
+     } else {
+-      ++it;
++      // Used inside this idle window; the deadline is now lastUsedFrame's, so eviction still lands
++      // on the frame it would have landed on when the table was walked every frame.
++      queue_object_cache_sweep(texObjId, entry);
+     }
+   }
+ 
+@@ -726,6 +771,7 @@
+ 
+ void shutdown() noexcept {
+   s_textureObjectCaches.clear();
++  s_objectCacheSweepQueue = {};
+   s_tlutObjectCaches.clear();
+   s_replacementUsers.clear();
+   s_contentCache.clear();

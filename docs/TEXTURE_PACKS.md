@@ -44,6 +44,13 @@ and uncompressed RGBA8; mip levels inside the DDS or as `<name>_mip<N>.png/.dds`
 size (upscaled packs are the usual case). They stream in on background threads: for the first
 frames after a texture appears the original is drawn.
 
+Publishing one is budgeted too: a decoded replacement is uploaded at the end of a frame within
+12 MB (Aurora patch **0248**), so a large one (a 4K texture is 21 MB as BC7 with its mips, 85 MB as
+RGBA8) goes up over a few frames, a row range at a time, with the original drawn until the last
+range lands. Without that budget one such texture was uploaded whole in one frame on the presenting
+thread, a 0.7-3 s stall the first time a room's big textures appeared (the `[texpack]` line below
+is how a run shows the budget holding).
+
 The US and European games share most textures (same hashes), so a GLME01 pack mostly works for
 GLMP01 too when it is put in a `GLM` folder or has no ID folder; text/logo textures differ.
 
@@ -55,6 +62,8 @@ they are next drawn (a short pop-in of the original). Every registered DDS keeps
 thumbnail (mip tail up to 64x64) in memory for instant pop-in; PNGs have none. The `[mem]` lines
 in last_run.log (every 60 s) have a `texture packs:` line: registrations, replacements on the GPU
 and their MB against the budget, pending loads, failed files, texture loads replaced, dump counts.
+Releases are counted (and logged, with the per-frame publishing cost) on the `[texpack]` line of
+`LM_TEXPACK_LOG` (see Test aids).
 
 ## For pack makers: dumping
 
@@ -98,7 +107,21 @@ the code is the same here.
 - `LM_TEXPACKS=0|1` master switch (overrides the setting)
 - `LM_TEXDUMP=1|<dir>` dump from the start (into `<dir>`)
 - `LM_TEXPACK_LOG=<s>` the `[mem] texture packs:` line every s seconds (1 = 5 s) and an Aurora info
-  line for the first use of each replacement (`texture_replacement: using <file> for <key>`)
+  line for the first use of each replacement (`texture_replacement: using <file> for <key>`), plus a
+  `[texpack]` line for the interval:
+
+  ```
+  [texpack] 5.0 s: 9 published, worst frame 12.0 MB in 0.5 ms, 7 frames over the 12 MB budget,
+      3 queued + 1.1 MB in flight, 18.0 MB published (3.6 MB/s), 0 evicted
+  ```
+
+  i.e. replacements fully uploaded, the worst single frame's upload (bytes and the time it took on
+  the presenting thread), frames that ended with publishing still to do (the budget holding back a
+  large texture), replacements decoded and waiting, bytes left of the one being written, the total
+  published and its rate, and replacements released by the memory budget. A run with a pack should
+  show `worst frame` at or under 12 MB (about 0.5 ms) and a `frames over the budget` count while a
+  large texture streams in; a multi-second freeze showed up as a single frame of tens of MB before
+  Aurora 0248.
 - `LM_TEXPACK_AT=<frame>:<action>[,...][;<frame>:...]` (or `|` between groups) at guest frames:
   `reload`, `on`, `off`, `dump`, `nodump`, `budget=<MB>`, `pack=<folder>:<0|1>`, `top=<folder>`
   (live changes as the menu makes them)
