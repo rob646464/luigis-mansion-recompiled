@@ -45,6 +45,9 @@ constexpr double kPi = 3.14159265358979323846;
 
 class Resampler {
 public:
+    // Widest layout the output can ask for (7.1): outPushGuestBlock picks 2, 6 or 8 channels.
+    static constexpr int kMaxChannels = 8;
+
     void configure(double inRate, double outRate, int channels) {
         if (inRate == mIn && outRate == mOut && channels == mCh) return;
         mIn = inRate;
@@ -97,12 +100,17 @@ public:
             const float* h0 = &mTable[size_t(ph) * kTaps];
             const float* h1 = h0 + kTaps;
             const float* x = &mHist[(i0 - (kZero - 1)) * mCh];
-            const size_t o = out.size();
-            out.resize(o + mCh, 0.0f);
+            // One accumulator per channel rather than a read-modify-write of the output vector: x and
+            // the output can alias as far as the compiler knows, so the partial sums stay in
+            // registers. Same products, same order of additions.
+            float acc[kMaxChannels] = {};
             for (int j = 0; j < kTaps; j++) {
                 const float h = h0[j] + (h1[j] - h0[j]) * a;
-                for (int c = 0; c < mCh; c++) out[o + c] += h * x[j * mCh + c];
+                for (int c = 0; c < mCh; c++) acc[c] += h * x[j * mCh + c];
             }
+            const size_t o = out.size();
+            out.resize(o + mCh, 0.0f);
+            for (int c = 0; c < mCh; c++) out[o + c] = acc[c];
             mPos += mStep;
         }
         // Drop the input no future output needs.
@@ -171,6 +179,11 @@ struct Wav {
 };
 
 std::mutex sM;
+// The per-block side data (centre / surround buses for discrete layouts) has its own lock, sSideM:
+// outTagBlock runs on a guest thread (Jac_imixcopy), so it must never wait behind sM, which the AI
+// DMA thread holds across the resampler, the limiter and the SDL calls. sSideM is only ever held for
+// one copy of one block. See docs/AUDIO.md "AI output and pacing".
+std::mutex sSideM;
 SDL_AudioStream* sStream = nullptr;
 bool sTried = false;
 double sRate = kConsoleRate32;  // AI sample rate of the blocks
@@ -221,10 +234,18 @@ void openDevice() {
     log("[audio] output started; device: %d channels at %d Hz; console rate %.2f Hz", sDevChannels.load(), sDevRate.load(), sRate);
 }
 
-const SideSample* sideFor(u32 dac) {
-    for (const auto& b : sBlockSide)
-        if (b.dac == dac && !b.v.empty()) return b.v.data();
-    return nullptr;
+// Copies the side data tagged for the block at `dac` into `out` (zero-filled when there is none,
+// or when the tag is shorter than the block). AI DMA thread only.
+void sideFor(u32 dac, SideSample* out, u32 frames) {
+    std::lock_guard lk(sSideM);
+    for (const auto& b : sBlockSide) {
+        if (b.dac != dac || b.v.empty()) continue;
+        const u32 n = std::min<u32>(frames, u32(b.v.size()));
+        std::copy(b.v.begin(), b.v.begin() + n, out);
+        std::fill(out + n, out + frames, SideSample{});
+        return;
+    }
+    std::fill(out, out + frames, SideSample{});
 }
 
 }  // namespace
@@ -259,9 +280,12 @@ void outSetPaused(bool paused) {
 bool outPaused() { return sPaused.load(); }
 
 void outTagBlock(u32 dac, u32 bufL, u32 frames) {
-    std::vector<SideSample> v(frames);
+    // Called on a guest thread, from Jac_imixcopy (hle_audio.cpp): fill a reused buffer outside the
+    // lock, then publish it with one copy (sSideM above).
+    static thread_local std::vector<SideSample> v;
+    v.resize(frames);
     if (!dspSideData(bufL, v.data(), frames)) return;
-    std::lock_guard lk(sM);
+    std::lock_guard lk(sSideM);
     BlockSide* b = nullptr;
     for (auto& x : sBlockSide)
         if (x.dac == dac) b = &x;
@@ -270,7 +294,7 @@ void outTagBlock(u32 dac, u32 bufL, u32 frames) {
         sBlockNext = (sBlockNext + 1) % sBlockSide.size();
         b->dac = dac;
     }
-    b->v = std::move(v);
+    b->v = v;
 }
 
 std::atomic<unsigned long long> sRawFrames{0};
@@ -307,7 +331,13 @@ void outPushGuestBlock(u32 addr, u32 bytes) {
     // Swap left/right (F1), and the PAL Hidden Mansion mirrors the picture, so the speakers too.
     const bool swap = as.swapChannels != hm::mirrorActive();
     const float gain = std::clamp(as.masterVolume, 0.0f, 1.0f) * skip::audioGain() / 32768.0f;
-    const SideSample* side = ch > 2 ? sideFor(addr) : nullptr;
+    // Snapshot the tagged side data in one copy under sSideM, then work on it without the lock.
+    static thread_local std::vector<SideSample> sideBuf;
+    if (ch > 2) {
+        sideBuf.resize(frames);
+        sideFor(addr, sideBuf.data(), frames);
+    }
+    const SideSample* side = ch > 2 ? sideBuf.data() : nullptr;
 
     static thread_local std::vector<float> buf;
     buf.assign(size_t(frames) * ch, 0.0f);

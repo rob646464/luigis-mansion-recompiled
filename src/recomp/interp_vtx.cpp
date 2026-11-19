@@ -124,21 +124,49 @@ void use(int slot, u32 idxLo, u32 idxEnd, u32 extra) {
     std::vector<u8>& d = sSnaps[cmd.snap].data;
     if (extent > d.size()) {  // copy what this draw reads beyond the copy so far, as it is now
         const u32 old = u32(d.size());
+        // The tape takes this buffer at the end of the game frame (vtxEndTape), so it starts empty and
+        // grows through the frame's draws that share the snapshot: without headroom each growth
+        // re-copied everything appended so far (~456 KiB per game frame).
+        if (d.capacity() < extent) d.reserve(extent + extent / 4);
         d.resize(extent);
         std::memcpy(d.data() + old, hostp(b.guest) + old, extent - old);
     }
 }
 
-// Bytes per vertex of format `fmt`, or 0 if unknown.
-u32 vertexSize(int fmt) {
-    u32 size = 0;
+// What the GX desc/format state makes of format `fmt`: bytes and GXAttrType per attribute, and the
+// vertex size. Both are pure in the layout state, which only the GXClearVtxDesc / GXSetVtxDesc* /
+// GXSetVtxAttrFmt* HLEs change (each bumping gx::vtxLayoutVersion), so an entry is rebuilt when the
+// version moves. All 17 attributes of every draw came from here and scanVertices (hottest leaf in the
+// process: 363 samples; attrSize 104 more).
+struct VtxLayout {
+    int size[GX_VA_TEX7 + 1];  // bytes per attribute, -1 unknown (as gx::vtxAttrSize)
+    u8 desc[GX_VA_TEX7 + 1];   // its GXAttrType (as gx::vtxDesc)
+    u32 stride = 0;            // vertexSize(fmt)
+    u32 version = ~0u;         // the gx::vtxLayoutVersion it was built from
+};
+// Last entry: no such format (every attribute unknown), so an out-of-range fmt needs no special case.
+VtxLayout sLayout[GX_MAX_VTXFMT + 1];
+
+const VtxLayout& layout(int fmt) {
+    const bool known = fmt >= 0 && fmt < GX_MAX_VTXFMT;
+    VtxLayout& l = sLayout[known ? fmt : GX_MAX_VTXFMT];
+    const u32 version = gx::vtxLayoutVersion();
+    if (l.version == version) return l;
+    u32 stride = 0;
+    bool all = true;
     for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) {
-        const int s = gx::vtxAttrSize(fmt, a);
-        if (s < 0) return 0;
-        size += u32(s);
+        l.desc[a] = gx::vtxDesc(a);
+        l.size[a] = known ? gx::vtxAttrSize(fmt, a) : -1;
+        if (l.size[a] < 0) all = false;
+        else stride += u32(l.size[a]);
     }
-    return size;
+    l.stride = all ? stride : 0;
+    l.version = version;
+    return l;
 }
+
+// Bytes per vertex of format `fmt`, or 0 if unknown.
+u32 vertexSize(int fmt) { return layout(fmt).stride; }
 
 // Bounding box of the indexed positions of the display list being parsed (vtxDisplayList): its centre
 // is the draw's pivot for tumbling things (interp.cpp, replayPair).
@@ -199,10 +227,11 @@ void boxPositions(int fmt, const u8* v, u32 count, u32 vtxSize, u32 offset, u32 
 // The indexed attributes of `count` vertices at `v`: extents of the arrays they read.
 void scanVertices(int fmt, const u8* v, u32 count, u32 vtxSize) {
     sScanFmt = fmt;
+    const VtxLayout& l = layout(fmt);
     u32 offset = 0;
     for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) {
-        const int s = gx::vtxAttrSize(fmt, a);
-        const u8 type = gx::vtxDesc(a);
+        const int s = l.size[a];
+        const u8 type = l.desc[a];
         if ((type == GX_INDEX8 || type == GX_INDEX16) && a >= GX_VA_POS) {
             const u32 idxSize = type == GX_INDEX16 ? 2 : 1;
             const u32 skip = type == GX_INDEX16 ? 0xFFFF : 0xFF;
@@ -765,10 +794,12 @@ u64 dlCheck(const u8* data, u32 size, u32 fmtMask) {
     auto mixByte = [&](u8 b) { h = (h ^ b) * 0x100000001B3ull; };
     for (u32 i = 0; i < size && i < 64; i++) mixByte(data[i]);
     for (u32 i = size > 64 ? std::max(64u, size - 64) : size; i < size; i++) mixByte(data[i]);
-    for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) mixByte(gx::vtxDesc(a));
+    const VtxLayout& l0 = layout(0);  // the desc bytes are per attribute, not per format
+    for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) mixByte(l0.desc[a]);
     for (int f = 0; f < 8; f++) {
         if (!(fmtMask >> f & 1)) continue;
-        for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) mixByte(u8(gx::vtxAttrSize(f, a) + 1));
+        const VtxLayout& l = layout(f);
+        for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) mixByte(u8(l.size[a] + 1));
     }
     return h;
 }
