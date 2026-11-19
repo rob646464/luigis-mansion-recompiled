@@ -45,6 +45,10 @@ int vtxAttrSize(int fmt, int attr);
 unsigned char vtxDesc(int attr);
 // The VAT entry of `attr` in format `fmt` (component count, GXCompType, fraction bits).
 bool vtxAttrFormat(int fmt, int attr, unsigned char& cnt, unsigned char& type, unsigned char& frac);
+// Changes exactly when vtxAttrSize/vtxDesc can answer something else (a GXClearVtxDesc,
+// GXSetVtxDesc* or GXSetVtxAttrFmt* HLE that changes the shadowed state; writing a value already
+// shadowed does not change it), so their results can be cached against it.
+unsigned int vtxLayoutVersion();
 // An active TEV stage samples an EFB copy.
 bool samplesCopy();
 }  // namespace recomp::gx

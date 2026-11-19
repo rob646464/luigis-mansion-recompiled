@@ -1438,14 +1438,15 @@ following), parts of Luigi (the flashlight) blink out, and the damage blink look
 ### What it does now
 
 1. **Aurora 0192** (`patches/aurora/0192-early-z-split-cache-merge.patch`): the split decision and
-   its two pipelines are cached with the draw cache, and while interpolating
-   (`GX_AURORA_ACCURACY_EARLY_Z_MERGE`, set by `gx::applyAccuracySettings` when the frame-rate
-   target is above 30) consecutive draws with the same state merge into one split pair (both halves
-   extended alike). Foyer FIFO drain per present: 25-30 ms -> ~11 ms (cache) -> **3.9 ms**
-   (merged). The merged pair differs from the per-draw order only where merged geometry overlaps
-   itself with alpha-rejected pixels: nursery test-mode dumps, merged vs exact, 578 px in 345
-   frames (edges of the Game Boy Horror hand, max 28 levels). Original 30 keeps the exact split.
-   `AURORA_EARLY_Z_MERGE=0/1/ab` overrides.
+   its two pipelines are cached with the draw cache, and with `GX_AURORA_ACCURACY_EARLY_Z_MERGE`
+   (`gx::applyAccuracySettings`, whenever "Early depth for cut-out textures" is on) consecutive
+   draws with the same state merge into one split pair (both halves extended alike). Foyer FIFO
+   drain per present: 25-30 ms -> ~11 ms (cache) -> **3.9 ms** (merged). The merged pair differs
+   from the per-draw order only where merged geometry overlaps itself with alpha-rejected pixels:
+   nursery test-mode dumps, merged vs exact, 578 px in 345 frames (edges of the Game Boy Horror
+   hand, max 28 levels). It used to be set only above 30, so Original 30 kept the exact split;
+   that cost half the frame rate on a weak PC (base M1, 7-core GPU, foyer at 1280x960: 15.5 fps
+   exact vs 29.6 merged), so it is now on at every rate (`AURORA_EARLY_Z_MERGE=0/1/ab` overrides).
 2. **Presentation clock** (`interp.cpp`, `Pacer`, `pace()`). Tapes go into a queue; per present:
    - a smoothed present clock (advances by the measured present period, pulled 10% toward the
      real time, resynchronized when a present is more than 4 ms off: a missed refresh);

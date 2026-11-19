@@ -52,7 +52,24 @@ bool sInDisplayList = false;  // GXBeginDisplayList..GXEndDisplayList: everythin
 // Fast-forward (skip.cpp): a frame that is not shown sends no draws or copies.
 bool dropDraw() { return gx::g_discardDraws && !sInDisplayList; }
 
-GXColor color(u32 p) { return GXColor{u8(rd8(p)), u8(rd8(p + 1)), u8(rd8(p + 2)), u8(rd8(p + 3))}; }
+// Test-aid switches, read from the environment once at start-up: a getenv per GX call walks the
+// environment (__findenv_locked on every light load and every display list), and none of them can
+// change while the game runs.
+const bool sHudTrace = std::getenv("LM_HUD_TRACE") != nullptr;
+const bool sTexgenLog = [] { const char* e = std::getenv("LM_TEXGEN_LOG"); return e && e[0] == '1'; }();
+const bool sIndLog = [] { const char* e = std::getenv("LM_IND_LOG"); return e && e[0] == '1'; }();
+const bool sIndOff = [] { const char* e = std::getenv("LM_IND_OFF"); return e && e[0] == '1'; }();
+const int sIndExpAdd = [] { const char* e = std::getenv("LM_IND_EXP"); return e ? std::atoi(e) : 0; }();
+const bool sIndPattern = [] { const char* e = std::getenv("LM_IND_PATTERN"); return e && e[0] == '1'; }();
+const bool sLightTrace = std::getenv("LM_LIGHT_TRACE") != nullptr;
+const bool sGxAuditOn = [] { const char* e = std::getenv("LM_GX_AUDIT"); return e && e[0] == '1'; }();
+
+// One big-endian word (R,G,B,A) instead of four byte reads, for every colour and fog register the
+// game sets.
+GXColor color(u32 p) {
+    const u32 v = rd32(p);
+    return GXColor{u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)};
+}
 f32 farg(const Ctx& c, int n) { return f32(c.f[n]); }
 
 template <int R, int C>
@@ -337,12 +354,31 @@ struct VatEntry {
 };
 u8 sDesc[GX_VA_MAX_ATTR] = {};           // GXAttrType per attribute
 VatEntry sVat[GX_MAX_VTXFMT][GX_VA_MAX_ATTR];
+// Bumped when a write to sDesc/sVat changes what vtxAttrSize/vtxDesc answer (gx::vtxLayoutVersion,
+// gx_bridge.h). Writing the value already shadowed must not bump it: J3D sets the same descriptor
+// list and formats for every shape, and a bump per write made interp rebuild all 17 attributes per
+// draw (macOS guest-thread sample: attrSize 104, vtxAttrSize 17, vtxDesc 20).
+u32 sVtxLayoutVersion = 0;
+
+int attrSlot(u32 attr) { return attr == GX_VA_NBT ? GX_VA_NRM : attr < GX_VA_MAX_ATTR ? int(attr) : -1; }
+void setDesc(u32 attr, u8 type) {
+    const int a = attrSlot(attr);
+    if (a < 0 || sDesc[a] == type) return;
+    sDesc[a] = type;
+    sVtxLayoutVersion++;
+}
+void setVat(u32 fmt, u32 attr, u8 cnt, u8 type, u8 frac) {
+    const int a = attrSlot(attr);
+    if (a < 0 || fmt >= GX_MAX_VTXFMT) return;
+    VatEntry& v = sVat[fmt][a];
+    if (v.cnt == cnt && v.type == type && v.frac == frac) return;
+    v = {cnt, type, frac};
+    sVtxLayoutVersion++;
+}
 u32 sPosArray = 0, sPosStride = 0;
 f32 sPosMtx[10][3][4];
 bool sPosMtxValid[10] = {};
 u32 sCurPosMtx = 0;
-
-int attrSlot(u32 attr) { return attr == GX_VA_NBT ? GX_VA_NRM : attr < GX_VA_MAX_ATTR ? int(attr) : -1; }
 
 int compSize(u8 type) { return type <= GX_S8 ? 1 : type <= GX_S16 ? 2 : 4; }
 
@@ -500,6 +536,7 @@ bool gx::samplesCopy() {
     return false;
 }
 u8 gx::vtxDesc(int attr) { return attr < GX_VA_MAX_ATTR ? sDesc[attr] : 0; }
+u32 gx::vtxLayoutVersion() { return sVtxLayoutVersion; }
 bool gx::vtxAttrFormat(int fmt, int attr, u8& cnt, u8& type, u8& frac) {
     if (fmt >= GX_MAX_VTXFMT || attr >= GX_VA_MAX_ATTR) return false;
     cnt = sVat[fmt][attr].cnt, type = sVat[fmt][attr].type, frac = sVat[fmt][attr].frac;
@@ -549,12 +586,12 @@ void gx::applyAccuracySettings() {
     u32 flags = (r.integerTev ? GX_AURORA_ACCURACY_INT_TEV : 0) | (r.efbColorDepth ? GX_AURORA_ACCURACY_EFB_DEPTH : 0) |
                 (r.efbColorDepth && r.efbBlend6 ? GX_AURORA_ACCURACY_EFB_BLEND : 0) |
                 (r.earlyZAlphaDepth ? GX_AURORA_ACCURACY_EARLY_Z : 0) |
-                // Interpolated presentation replays every frame on the host after the fact: the
-                // per-draw early-Z split cost ~20 ms per replay in the foyer (presentation fell to
-                // ~35 fps); merged split pairs keep it at ~4 ms. Original 30 keeps the exact split.
-                (r.earlyZAlphaDepth && (port::settings().video.matchDisplay || port::settings().video.targetFps > port::kMinFps)
-                     ? GX_AURORA_ACCURACY_EARLY_Z_MERGE
-                     : 0) |
+                // Merged split pairs (Aurora 0182) instead of resetting the draw cache after every
+                // split draw: the two halves are the same config, and both batch. Foyer at the game's
+                // own 30 fps target, base M1 (7-core GPU): 1280x960 15.5 -> 29.6 fps, GPU busy 25 ->
+                // 22 ms. Exact split difference (578 px in 345 nursery frames): docs/INTERPOLATION.md,
+                // docs/RENDERING.md.
+                (r.earlyZAlphaDepth ? GX_AURORA_ACCURACY_EARLY_Z_MERGE : 0) |
                 (r.textureCopyFilter ? GX_AURORA_ACCURACY_COPY_FILTER : 0);
     // Enhanced lighting turns the 6-bit EFB (and with it 6-bit blending, the dither and the
     // smoothing of 0190) off: its smooth per-pixel and colored-light gradients went through the
@@ -606,13 +643,14 @@ void gx::applyAccuracySettings() {
 // LM_HUD_TRACE=<first>,<last>[,<step>]: for those frames (GXCopyDisp count), every 2D draw, viewport,
 // scissor and texture copy with its guest call chain, to map HUD pieces to game functions.
 static u32 sDiagFrame = 0;
+const auto sHudTraceRange = [] {
+    u32 a = ~0u, b = 0, step = 1;
+    if (const char* v = std::getenv("LM_HUD_TRACE")) std::sscanf(v, "%u,%u,%u", &a, &b, &step);
+    return std::tuple<u32, u32, u32>{a, b, step ? step : 1};
+}();
 static bool hudTraceOn() {
-    static const auto range = [] {
-        u32 a = ~0u, b = 0, step = 1;
-        if (const char* v = std::getenv("LM_HUD_TRACE")) std::sscanf(v, "%u,%u,%u", &a, &b, &step);
-        return std::tuple<u32, u32, u32>{a, b, step ? step : 1};
-    }();
-    const auto [first, last, step] = range;
+    if (!sHudTrace) return false;
+    const auto [first, last, step] = sHudTraceRange;
     return sDiagFrame >= first && sDiagFrame <= last && (sDiagFrame - first) % step == 0;
 }
 static std::string guestChain(const Ctx& c) {
@@ -652,14 +690,8 @@ std::unordered_map<u32, u32> sImageDesc;  // image -> w<<20 | h<<8 | fmt (LM_IND
 std::map<std::string, u32> sIndFrame, sIndLast;
 u32 sIndLastFrame = 0;
 // LM_IND_OFF=1 (A/B test aid): indirect stages are never enabled, i.e. the warp is drawn unwarped.
-bool indOff() {
-    static const bool on = [] { const char* e = std::getenv("LM_IND_OFF"); return e && e[0] == '1'; }();
-    return on;
-}
-bool indLogOn() {
-    static const bool on = [] { const char* e = std::getenv("LM_IND_LOG"); return e && e[0] == '1'; }();
-    return on;
-}
+bool indOff() { return sIndOff; }
+bool indLogOn() { return sIndLog; }
 u32 indWord(u32 st, u32 fmt, u32 bias, u32 mtx, u32 ws, u32 wt, u32 prev, u32 lod, u32 alpha) {
     return st | fmt << 2 | bias << 4 | alpha << 7 | mtx << 9 | ws << 13 | wt << 16 | lod << 19 | prev << 20;
 }
@@ -676,8 +708,7 @@ std::string imageDesc(u32 image) {
 // texture coordinate at or beyond GXSetNumTexGens, logged once with the stage setup.
 u8 sTevCoord[16] = {};
 static void texgenNoteDraw(const Ctx& c, const char* kind) {
-    static const bool on = [] { const char* e = std::getenv("LM_TEXGEN_LOG"); return e && e[0] == '1'; }();
-    if (!on) return;
+    if (!sTexgenLog) return;
     std::string what;
     char b[96];
     for (u32 s = 0; s < sNumTevStages && s < 16; s++)
@@ -784,10 +815,8 @@ static bool dlTraceFrameOn() {
     }();
     return sDlFrame >= range.first && sDlFrame <= range.second;
 }
-static FILE* dlTraceFile() {
-    static FILE* f = [] { const char* p = std::getenv("LM_DL_TRACE"); return p ? std::fopen(p, "w") : nullptr; }();
-    return f && dlTraceFrameOn() ? f : nullptr;
-}
+FILE* const sDlTrace = [] { const char* p = std::getenv("LM_DL_TRACE"); return p ? std::fopen(p, "w") : nullptr; }();
+static FILE* dlTraceFile() { return sDlTrace != nullptr && dlTraceFrameOn() ? sDlTrace : nullptr; }
 
 u32 copyDispCount();
 
@@ -1003,11 +1032,7 @@ void beforeGxCall(const Ctx& c) {
 // GX state audit (LM_GX_AUDIT=1): logs each distinct argument combination of the state calls
 // that matter for hardware accuracy (copy filter, gamma, fog, lights, LOD...), once.
 static void gxAudit(const char* fmt, ...) {
-    static const bool on = [] {
-        const char* e = std::getenv("LM_GX_AUDIT");
-        return e && e[0] == '1';
-    }();
-    if (!on) return;
+    if (!sGxAuditOn) return;
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -1045,20 +1070,20 @@ GXHLE(GXInvalidateTexAll) { GXInvalidateTexAll(); }
 // --- vertex format ----------------------------------------------------------------
 
 GXHLE(GXClearVtxDesc) {
-    std::memset(sDesc, 0, sizeof(sDesc));
+    if (std::any_of(sDesc, sDesc + GX_VA_MAX_ATTR, [](u8 d) { return d != 0; })) {
+        std::memset(sDesc, 0, sizeof(sDesc));
+        sVtxLayoutVersion++;
+    }
     GXClearVtxDesc();
 }
-GXHLE(GXSetVtxDesc) {
-    if (const int a = attrSlot(c.r[3]); a >= 0) sDesc[a] = u8(c.r[4]);
-    GXSetVtxDesc(GXAttr(c.r[3]), GXAttrType(c.r[4]));
-}
+GXHLE(GXSetVtxDesc) { setDesc(c.r[3], u8(c.r[4])); GXSetVtxDesc(GXAttr(c.r[3]), GXAttrType(c.r[4])); }
 GXHLE(GXSetVtxDescv) {
     GXVtxDescList list[32];
     int n = 0;
     for (u32 p = c.r[3]; n < 31; p += 8) {
         list[n].attr = GXAttr(rd32(p));
         list[n].type = GXAttrType(rd32(p + 4));
-        if (const int a = attrSlot(list[n].attr); a >= 0) sDesc[a] = u8(list[n].type);
+        setDesc(list[n].attr, u8(list[n].type));
         if (list[n++].attr == GX_VA_NULL) break;
     }
     list[n - 1].attr = GX_VA_NULL;
@@ -1070,8 +1095,7 @@ GXHLE(GXGetVtxDesc) {
     wr32(c.r[4], u32(t));
 }
 GXHLE(GXSetVtxAttrFmt) {
-    if (const int a = attrSlot(c.r[4]); a >= 0 && c.r[3] < GX_MAX_VTXFMT)
-        sVat[c.r[3]][a] = {u8(c.r[5]), u8(c.r[6]), u8(c.r[7])};
+    setVat(c.r[3], c.r[4], u8(c.r[5]), u8(c.r[6]), u8(c.r[7]));
     GXSetVtxAttrFmt(GXVtxFmt(c.r[3]), GXAttr(c.r[4]), GXCompCnt(c.r[5]), GXCompType(c.r[6]), u8(c.r[7]));
 }
 GXHLE(GXSetVtxAttrFmtv) {
@@ -1079,8 +1103,7 @@ GXHLE(GXSetVtxAttrFmtv) {
     int n = 0;
     for (u32 p = c.r[4]; n < 31; p += 16) {
         list[n] = {GXAttr(rd32(p)), GXCompCnt(rd32(p + 4)), GXCompType(rd32(p + 8)), u8(rd8(p + 12))};
-        if (const int a = attrSlot(list[n].attr); a >= 0 && c.r[3] < GX_MAX_VTXFMT)
-            sVat[c.r[3]][a] = {u8(list[n].cnt), u8(list[n].type), list[n].frac};
+        setVat(c.r[3], list[n].attr, u8(list[n].cnt), u8(list[n].type), list[n].frac);
         if (list[n++].attr == GX_VA_NULL) break;
     }
     list[n - 1].attr = GX_VA_NULL;
@@ -1372,7 +1395,7 @@ GXHLE(GXLoadLightObjImm) {
     // Position and direction (view space) are blended by frame interpolation.
     const u32 at = interp::mark();
     GXLoadLightObjImm(light(c.r[3]), GXLightID(c.r[4]));
-    if (std::getenv("LM_LIGHT_TRACE")) {
+    if (sLightTrace) {
         const auto* lo = reinterpret_cast<const float*>(hostp(c.r[3]) + 4);  // a0 a1 a2 k0 k1 k2 px..nz
         static std::vector<u64> seen;
         const u64 key = u64(c.lr) << 32 | c.r[4] | u64(lo[1] != 0.0f) << 31;
@@ -1400,8 +1423,7 @@ GXHLE_CPU(GXInitTexObj) {
     GXInitTexObj(sTex.forInit(c.r[3], kTexTag), image ? image : ptr(c.r[4]), u16(c.r[5]), u16(c.r[6]), GXTexFmt(c.r[7]),
                  GXTexWrapMode(c.r[8]), GXTexWrapMode(c.r[9]), GXBool(c.r[10]));
     noteTexImage(c.r[3], c.r[4]);
-    static const bool sHudTraceSet = std::getenv("LM_HUD_TRACE") != nullptr;  // texture sizes in its held lines
-    if (indLogOn() || sHudTraceSet) sImageDesc[phys(c.r[4])] = (c.r[5] & 0xFFF) << 20 | (c.r[6] & 0xFFF) << 8 | (c.r[7] & 0xFF);
+    if (indLogOn() || sHudTrace) sImageDesc[phys(c.r[4])] = (c.r[5] & 0xFFF) << 20 | (c.r[6] & 0xFFF) << 8 | (c.r[7] & 0xFF);
     diagTexInit("INIT", c.r[3], c.r[4], c.r[5], c.r[6], c.r[7], c.lr);
 }
 GXHLE_CPU(GXInitTexObjCI) {
@@ -1553,8 +1575,7 @@ GXHLE(GXSetIndTexMtx) {
         sInd.exp[id] = s8(c.r[5]);
     }
     // LM_IND_EXP=<n> (test aid): adds n to the matrix scale exponent (2^n times the offsets).
-    static const int sExpAdd = [] { const char* e = std::getenv("LM_IND_EXP"); return e ? std::atoi(e) : 0; }();
-    GXSetIndTexMtx(GXIndTexMtxID(c.r[3]), m.m, s8(s8(c.r[5]) + sExpAdd));
+    GXSetIndTexMtx(GXIndTexMtxID(c.r[3]), m.m, s8(s8(c.r[5]) + sIndExpAdd));
 }
 GXHLE(GXSetTevDirect) {
     if (c.r[3] < 16) sInd.tev[c.r[3]] = 0;
@@ -1565,8 +1586,7 @@ GXHLE(GXSetTevIndWarp) {
     // indirect texture (US 0x803CFD40, filled with random intensities by fn_8005FD80 at boot) with
     // a known pattern: intensity 15 (offset 0) in the left half, 0 (offset -5 texels in s and t)
     // in the right half.
-    static const bool sPattern = [] { const char* e = std::getenv("LM_IND_PATTERN"); return e && e[0] == '1'; }();
-    if (const u32 img = sMapImage[sInd.order[c.r[4] & 3][1] & 7]; sPattern && img) {
+    if (const u32 img = sMapImage[sInd.order[c.r[4] & 3][1] & 7]; sIndPattern && img) {
         u8* tex = hostp(0x80000000u | img);
         for (u32 i = 0; i < 64 * 64; i++) {
             const u32 tile = i / 32, bx = tile % 8, x = bx * 8 + i % 8;
@@ -1603,7 +1623,9 @@ GXHLE(GXSetDither) {
 GXHLE(GXSetZCompLoc) {
     gxAudit("GXSetZCompLoc %u", c.r[3]); GXSetZCompLoc(GXBool(c.r[3])); }
 GXHLE(GXSetBlendMode) {
-    if (c.r[3] == GX_BM_LOGIC)  // logic ops: where the game uses them (Aurora 0026)
+    // Logic ops: where the game uses them (Aurora 0026). guestChain walks the guest stack and
+    // allocates, so it is only built when the audit is on.
+    if (c.r[3] == GX_BM_LOGIC && sGxAuditOn)
         gxAudit("GXSetBlendMode %u %u %u %u from %s", c.r[3], c.r[4], c.r[5], c.r[6], guestChain(c).c_str());
     else
         gxAudit("GXSetBlendMode %u %u %u %u", c.r[3], c.r[4], c.r[5], c.r[6]);

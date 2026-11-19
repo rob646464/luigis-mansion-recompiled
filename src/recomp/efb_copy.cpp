@@ -31,6 +31,8 @@ int envInt(const char* name, int def) {
 
 const int sEnvEnabled = envInt("LM_EFB_RAM", -1);
 const bool sLog = std::getenv("LM_COPY_LOG") != nullptr;
+// Test aid LM_DUMP_EXIT=1: quit once the LM_SHOT or LM_FRAME_DUMP range is written (automated runs).
+const bool sDumpExit = envInt("LM_DUMP_EXIT", 0) != 0;
 
 // A named one-off dump (requestNamedDump): written by the next guest frame.
 struct Named {
@@ -209,13 +211,12 @@ void onFrame(u32 frameNo) {
         std::snprintf(path, sizeof path, "%s/s%05u.ppm", sShot.dir.c_str(), frameNo);
         aurora_request_screenshot(path);
     }
-    if (sShot.on && envInt("LM_DUMP_EXIT", 0) != 0 && !sDump.active && frameNo > sShot.last + 10) {
+    if (sShot.on && sDumpExit && !sDump.active && frameNo > sShot.last + 10) {
         log("[efb] screenshot range done, exiting (LM_DUMP_EXIT)");
         std::fflush(nullptr);
         std::_Exit(0);
     }
     // Test aid LM_DUMP_EXIT=1: quit once the LM_FRAME_DUMP range is written (automated runs).
-    static const bool sDumpExit = envInt("LM_DUMP_EXIT", 0) != 0;
     if (sDumpExit && sDump.active && frameNo > sDump.last + 10) {
         log("[efb] frame dump range done, exiting (LM_DUMP_EXIT)");
         std::fflush(nullptr);

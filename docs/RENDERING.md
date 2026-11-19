@@ -3069,6 +3069,15 @@ byte-identical between `AURORA_GX_SEQ=0` and 1, with default settings and with E
 (One Enhanced-lighting run of the old path differed from all the others, including a rerun of
 the old path: the opening is not fully deterministic from run to run. Compare two runs per side.)
 
+**Merged split pairs at Original 30.** 0229 made the split affordable per command, but the two
+halves stayed unbatched at 30: `GX_AURORA_ACCURACY_EARLY_Z_MERGE` (0182) was set only above 30, so
+the draw cache was reset after every split draw. Measured on a base M1 (7-core GPU, 8 GB, macOS
+26.6.2), foyer with `LM_TEST_STATE=poltergust` at 1280x960: the FIFO thread limited the game to
+15.5 fps; with merged pairs 29.6 fps (GPU busy 25 -> 22 ms). At 2560x1920 the foyer reached 30 and a
+heavier room 20 fps, the GPU then being the limit. The merged form is the one every interpolated
+session already renders (578 px in 345 nursery frames from the exact split, above), so it is now
+used at every frame rate.
+
 Test route for the key door (US): `LM_START_MAP=2 LM_START_APPEAR=6 LM_PATCHES=41,42` (Luigi
 counts as having every key), `LM_SKIP_TEST=2700:pos:-850,290,-600` (on the left stairs), input
 `2780:STICKRIGHT*60,2840:STICKUP+STICKRIGHT*40,2880:STICKUP*60,2960:STICKLEFT*30,3000:STICKUP*40,3050:A*3,3080:STICKUP*40`
