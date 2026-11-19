@@ -43,11 +43,18 @@ namespace {
 // guest threads (OSExitThread, OSCancelThread, shutdown) by throwing sched::ThreadExit through
 // the module's frames, which Windows can only unwind with .pdata and Linux with .eh_frame
 // (+ the .eh_frame_hdr lookup table the linker writes).
+//
+// The optimisation level is appended by moduleCompileFlags() below. -O3 is safe for this code because
+// nothing here enables fast-math: -ffp-contract=off keeps every guest fmul/fadd separate (arm64 would
+// otherwise contract a*b+c into one fmadd), and without -ffast-math the optimiser may vectorize but
+// must not reassociate, so guest arithmetic stays bit-identical. It buys inlining inside each
+// translation unit, where the hot call chains sit; -flto=thin reaches across chunks but turns the link
+// into one whole-module codegen pass (~25 MB of code).
 #ifdef _WIN32
 // Windows: stack probes stay on (module_rt.cpp provides __chkstk: a generated function with
 // a frame above a page would otherwise skip the stack guard page and fault; SMS port fix).
 const std::vector<std::string> kCompileFlags = {
-    "--target=x86_64-pc-windows-msvc", "-std=c++20", "-O2", "-ffreestanding", "-nostdinc", "-fno-exceptions",
+    "--target=x86_64-pc-windows-msvc", "-std=c++20", "-ffreestanding", "-nostdinc", "-fno-exceptions",
     "-fno-rtti", "-fno-threadsafe-statics", "-fno-math-errno", "-fno-stack-protector", "-funwind-tables",
     "-Wno-unused-label", "-Wno-unused-variable"};
 const std::vector<std::string> kLinkFlags = {"/dll", "/noentry", "/nodefaultlib", "/machine:x64", "/opt:ref",
@@ -68,7 +75,7 @@ constexpr const char* kLinkerName = "lld-link";
 #define LM_MODULE_ARCH "x86_64"
 #endif
 const std::vector<std::string> kCompileFlags = {
-    "--target=" LM_MODULE_ARCH "-apple-macos13.0", "-std=c++20", "-O2", "-fPIC", "-fvisibility=hidden",
+    "--target=" LM_MODULE_ARCH "-apple-macos13.0", "-std=c++20", "-fPIC", "-fvisibility=hidden",
     "-ffreestanding", "-nostdinc", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics", "-fno-math-errno",
     "-fno-stack-protector", "-ffp-contract=off", "-funwind-tables", "-Wno-unused-label", "-Wno-unused-variable"};
 const std::vector<std::string> kLinkFlags = {"-dylib", "-arch", LM_MODULE_ARCH, "-platform_version", "macos", "13.0",
@@ -85,7 +92,7 @@ constexpr const char* kLinkerName = "ld64.lld";
 // helper (one the compiler calls that module_rt.cpp does not provide) into a link error
 // instead of a dlopen failure.
 const std::vector<std::string> kCompileFlags = {
-    "--target=x86_64-pc-linux-gnu", "-std=c++20", "-O2", "-fPIC", "-fvisibility=hidden", "-ffreestanding",
+    "--target=x86_64-pc-linux-gnu", "-std=c++20", "-fPIC", "-fvisibility=hidden", "-ffreestanding",
     "-nostdinc", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics", "-fno-math-errno",
     "-fno-stack-protector", "-funwind-tables", "-Wno-unused-label", "-Wno-unused-variable"};
 const std::vector<std::string> kLinkFlags = {"-shared", "-nostdlib", "--eh-frame-hdr", "-Bsymbolic",
@@ -96,6 +103,18 @@ constexpr const char* kObjExt = ".o";
 constexpr const char* kExeSuffix = "";
 constexpr const char* kLinkerName = "ld.lld";
 #endif
+
+// The compile flags with the optimisation level last. LM_MODULE_OPT=-O3 rebuilds the module at -O3 to
+// compare the guest thread's cost and LM_FRAME_DUMP output against the default; the level is part of
+// moduleKey, so a module built with another level is never reused. -O3 stays opt-in: safe for guest
+// arithmetic (-ffp-contract=off, no fast-math), but the byte-identical frame-dump A/B this project
+// asks for is not done, because the dumped frame numbers drift between runs.
+std::vector<std::string> moduleCompileFlags() {
+    const char* opt = std::getenv("LM_MODULE_OPT");
+    std::vector<std::string> flags = kCompileFlags;
+    flags.emplace_back(opt != nullptr && opt[0] != '\0' ? opt : "-O2");
+    return flags;
+}
 
 // Paths here are plain (they are also clang/lld arguments, which take no \\?\ prefix; LLVM
 // itself handles plain paths past MAX_PATH). Our own file calls go through port::longPath, so a
@@ -251,7 +270,7 @@ std::string moduleKey(const Disc& disc) {
     // bundled clang/lld).
     text += std::string("program ") + port::update::buildVersion() + "\n";
     text += std::string("game ") + port::gameId(disc.version()) + " " + disc.dolSha1() + "\n";
-    for (auto& f : kCompileFlags) text += f + " ";
+    for (auto& f : moduleCompileFlags()) text += f + " ";
     for (auto& f : kLinkFlags) text += f + " ";
     for (std::string_view part : {embedded::symbols(ver), embedded::splits(ver), embedded::versionMap(ver),
                                   embedded::hooks(), embedded::ctxHeader(), embedded::moduleAbiHeader(),
@@ -416,7 +435,7 @@ bool buildModule(const Disc& disc, const Progress& progress, std::string& error)
             obj += kObjExt;
             auto log = work / "obj" / src.stem();
             log += ".log";
-            std::vector<std::string> args(kCompileFlags.begin(), kCompileFlags.end());
+            std::vector<std::string> args = moduleCompileFlags();
             args.push_back("-I" + utf8(work / "include"));
             args.push_back("-c");
             args.push_back(utf8(src));

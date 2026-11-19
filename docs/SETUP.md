@@ -419,11 +419,14 @@ LuigisMansionRecomp.exe                     module.dll (no imports, no CRT)
   back-edges), and indirect calls binary-search the module's own table. Everything else
   (MMIO, interrupts, HLE lookups, SPRs, tracing, fatal errors) goes through the
   `RuntimeApi` function pointers.
-- The module is compiled with `-ffreestanding -nostdinc -fno-exceptions -fno-rtti
-  -fno-threadsafe-statics -fno-math-errno -fno-stack-protector -funwind-tables` and
-  linked `/dll /noentry /nodefaultlib`; `module_rt.cpp` provides `memcpy`/`memset`/
-  `memmove`/`memcmp`, `_fltused`, `__chkstk`, and `fma`/`trunc`/`nearbyint`/`sqrt`
-  (forwarded to the runtime's CRT).
+- The module is compiled with `-O2 -ffreestanding -nostdinc -fno-exceptions -fno-rtti
+  -fno-threadsafe-statics -fno-math-errno -fno-stack-protector -funwind-tables` (macOS adds
+  `-ffp-contract=off`; no fast-math, so a higher level cannot change the guest's arithmetic,
+  only inline more of it) and linked `/dll /noentry /nodefaultlib`; `module_rt.cpp`
+  provides `memcpy`/`memset`/`memmove`/`memcmp`, `_fltused`, `__chkstk`, and
+  `fma`/`trunc`/`nearbyint`/`sqrt` (forwarded to the runtime's CRT). `LM_MODULE_OPT=-O3`
+  builds the same module at another optimisation level for A/B runs (frame dumps must stay
+  byte-identical before that becomes the default); it is part of the key below.
 - Unwind tables are required: the runtime ends guest threads (OSExitThread, OSCancelThread,
   shutdown) by throwing `sched::ThreadExit` through the module's frames, and Windows can only
   unwind frames that have `.pdata`. Without them closing the window ended the process with
