@@ -56,6 +56,20 @@ different folders on macOS. `LM_LLVM_DIR` overrides at run time. The `clang` fir
 The XDG variables still override the macOS folders, so test runs use scratch folders the same
 way as on Linux: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `LM_CARD_DIR`.
 
+### Retina: "Match window" renders the window's size in points
+
+Aurora creates the window with `SDL_WINDOW_HIGH_PIXEL_DENSITY`, so on a Retina panel the drawable is
+the point size times the display scale (2x) in each direction. "Match window" (`resolution_scale=0`)
+used to hand that drawable size to aurora, i.e. the default 1280x960 window rendered 2560x1920, 4x
+the pixels of every 1x display at the same window size. On a base M1 (7-core GPU) that is the whole
+GPU budget: the foyer held 30 fps but a heavier room fell to 20 (GPU busy ~105 ms per frame at
+2560x1920 against ~22 ms at 1280x960), and the menu showed only "Match window". The port now passes
+the window's point size (`src/recomp/menu.cpp`, `applyResolution`), keeps it in step when the window
+is resized, logs the buffer in use (`[video] rendering 1280x960, match window (window 1280x960
+points, 2560x1920 pixels)`) and shows it in the F1 slider label. 1x displays are unaffected; a fixed
+Nx still renders N x 480 lines, so the drawable's own pixels remain one slider step away (a
+1280x960-point window needs 3x).
+
 ### Floating point on arm64
 
 arm64 compilers fuse `a*b+c` into one `fmadd` by default (`-ffp-contract=on`); x86-64 builds

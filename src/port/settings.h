@@ -24,7 +24,7 @@ struct VideoSettings {
     bool unlimitedFps = false;  // interpolated, as fast as the PC can (no frame-rate cap or schedule)
     bool matchDisplay = false;
     AspectMode aspect = AspectMode::Auto;
-    int resolutionScale = 0;    // internal render resolution: 0 = match window, N = N x 480p (aspect-widened)
+    int resolutionScale = 0;    // internal render resolution: 0 = match window (its size in points), N = N x 480p (aspect-widened)
     float fovScale = 1.0f;      // multiplies the game's vertical field of view
     bool fullscreen = false;
     bool vsync = true;          // applied at next launch

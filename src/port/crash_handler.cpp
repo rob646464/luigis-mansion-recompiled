@@ -212,6 +212,9 @@ void installSignalHandlers() {
 // ---- Hang watchdog ----
 std::atomic<unsigned long long> sHeartbeat{0};
 std::atomic<const char*> sPhase{"startup"};
+// Set once the main loop is left for good (setShuttingDown): from then on a main thread that does
+// not heartbeat is the shutdown sequence, not a hang.
+std::atomic<bool> sShuttingDown{false};
 
 #ifdef _WIN32
 
@@ -381,6 +384,9 @@ void hangLine(const char* line) {
 void setHangDetail(HangDetailFn fn) { sHangDetail.store(fn, std::memory_order_release); }
 
 void reportStall(const char* what, bool dumpThreads) {
+    // A normal exit is not a stall: the main loop is gone for good, so nothing it noticed (no
+    // frame presented, the guest stopped finishing frames) is worth a report any more.
+    if (sShuttingDown.load(std::memory_order_relaxed)) return;
     char detail[512] = "";
     if (const HangDetailFn fn = sHangDetail.load(std::memory_order_acquire)) fn(detail, sizeof(detail), false);
     char line[1024];
@@ -397,13 +403,23 @@ void heartbeat() {
 }
 
 void setPhase(const char* phase) { sPhase.store(phase, std::memory_order_relaxed); }
+const char* phase() { return sPhase.load(std::memory_order_relaxed); }
+
+void setShuttingDown() {
+    sShuttingDown.store(true, std::memory_order_relaxed);
+    // Before the flag's effect is relied on, the run stops being "running" in last_run_state.ini: a
+    // shutdown longer than the watchdog's patience (or killed by a player) ended normally, and must
+    // not bring up the recovery prompt as an unclean exit (issue #14). A crash still overwrites it.
+    recovery::onExit();
+}
 
 void startHangWatchdog() {
     // Always on (issue #14: a start that stopped after the shader cache opened left no reason in the
     // log): when the main thread has not come back to its loop for 15 s, say what it was doing
     // (setPhase), again every 30 s while it lasts and once when it continues. A program that is
     // only slow (a long load) gets a few lines; one that hangs has its last phase in the log.
-    // LM_HANG_DUMP=<seconds> also prints every thread's stack (three samples a second apart). Linux
+    // (The shutdown sequence is exempt: setShuttingDown comes before it.) LM_HANG_DUMP=<seconds>
+    // also prints every thread's stack (three samples a second apart). Linux
     // prints them once by itself at the first report of a run (the log is the only evidence a
     // player can send; issue #11). Each report also says what Aurora's threads are doing and
     // whether the game kept running (setHangDetail).
@@ -419,6 +435,15 @@ void startHangWatchdog() {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             const unsigned long long now = sHeartbeat.load();
             const char* phase = sPhase.load(std::memory_order_relaxed);
+            // Left the main loop for good (setShuttingDown): the shutdown may spend a long time
+            // releasing GPU objects and writing caches, and the watcher has nothing left to watch.
+            // Reset as if it had progressed, so no report is built from a stall under way at the flag.
+            if (sShuttingDown.load(std::memory_order_relaxed)) {
+                last = now;
+                still = 0;
+                stalledIn = nullptr;
+                continue;
+            }
             if (now != last || phase == nullptr) {  // progress, or waiting on purpose (window paused)
                 if (still >= 15 && stalledIn) {
                     char line[256];

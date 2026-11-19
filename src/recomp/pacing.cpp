@@ -1,6 +1,7 @@
 #include "recomp/pacing.h"
 #include "recomp/mem_report.h"
 
+#include "port/crash_handler.h"
 #include "port/settings.h"
 #include "recomp/cpu_qos.h"
 #include "recomp/frame.h"
@@ -429,6 +430,45 @@ double median(const std::deque<double>& d) {
     return v[v.size() / 2];
 }
 
+// --- refresh hold (LM_PACING_KEEP_REFRESH=0 restores the even rate) ------------------------------
+// On a fixed-refresh display a target at or above the refresh can only be shown at the refresh or at
+// half of it (60 or 30 on a 60 Hz panel), and the governor halves it even for a near miss (17.1 ms
+// against a 16.7 ms budget is 56.7 fps, divisor 2). The refresh is kept while the governor's limit
+// (achieved period + 3%) stays under 1.15x the refresh and given up above 1.20x; the dead band is the
+// hysteresis, since a drop leaves a floor at 0.97x the limit that caused it (1.164x there), so equal
+// thresholds would alternate 60/30 once a second. A room at 19.5-20.2 ms (limit 1.20-1.25x) still
+// halves. A 30 minute playtest log at 1680x988: 22 slowdowns, 13 near misses (16.3-17.2 ms against
+// 16.7), 8 of the 11 windows that sat at 30 fps under the GPU budget, 180 s at half rate.
+const bool sKeepRefresh = [] { const char* v = std::getenv("LM_PACING_KEEP_REFRESH"); return !(v && *v == '0'); }();
+constexpr double kKeepRefreshEnter = 1.15;
+constexpr double kKeepRefreshLeave = 1.20;
+bool sKeepHolding = false;  // the refresh is being kept over a slowdown
+
+// Reported by the governor's log: the divisor is 1 because the refresh was kept, not because the
+// governor stopped limiting.
+bool keepRefreshHolding();
+
+// --- LM_DIP_LOG=1: what the pacer counted in a second that missed a slot ---------------------------
+// The [pacing] line ("15 of 60 frames late in 1 s, 17.1 ms achieved vs 16.7 ms") says the rate was
+// missed but not which frames were slow, on which schedule, or whether a late start was a hitch.
+// Present timing is absent where Dawn cannot report GPU completion, so this works from the timer
+// alone: the start intervals the governor judges and each frame's host time (LM_PACING_LOG's cpu
+// column), plus GPU cost when present timing exists. One line a second, for missed slots only.
+struct Dip {
+    u32 misses = 0, late = 0, hitches = 0;
+    double worst = 0;           // s: the worst start interval judged in this second (a miss or a hitch)
+    std::vector<float> host;    // ms: each presented frame's host time
+    Clock::time_point since{};  // start of the rate-limit window
+    u32 slowdowns = 0;          // sGov.slowdowns at the last line
+} sDip;
+const bool sDipOn = [] { const char* v = std::getenv("LM_DIP_LOG"); return v && *v == '1'; }();
+
+void dipReset() {
+    sDip.misses = sDip.late = sDip.hitches = 0;
+    sDip.worst = 0;
+    sDip.host.clear();
+}
+
 // --- rate governor ---------------------------------------------------------------------------------
 // Decides whether the PC sustains the target from what actually happens on screen, not from a cost
 // estimate. The old rule (period >= p90 of the measured frame cost x 1.08 over 45 frames) failed in
@@ -474,6 +514,19 @@ void governFrame(Clock::time_point start, double expected, double target, bool s
     while (!g.intervals.empty() && start - g.intervals.front().t > std::chrono::milliseconds(1000)) g.intervals.pop_front();
     if (iv > std::max(3.0 * expected, expected + 0.05)) {
         g.hitches++;  // a load or compile: not a sign the PC cannot hold the rate
+        // Name the hitch: the playtest's remaining dips were 100-235 ms single frames, and the log
+        // could not say whether they were a room load, a shader compile or the host being starved. The
+        // phase is what main.cpp set before the frame (setPhase); the guest frame count says where.
+        static u32 sLogged = 0;
+        if (sLogged < 64) {  // a run's first hitches are the informative ones; keep logs bounded
+            sLogged++;
+            log("[hitch] %.1f ms at a %.1f ms target (%u guest frames, phase \"%s\")", iv * 1e3, expected * 1e3,
+                frame::guestFrames(), port::phase() ? port::phase() : "?");
+        }
+        if (sDipOn) {
+            sDip.hitches++;
+            sDip.worst = std::max(sDip.worst, iv);
+        }
         g.judgeFrom = std::max(g.judgeFrom, start + std::chrono::milliseconds(1000));
         g.intervals.clear();
         return;
@@ -491,6 +544,10 @@ void governFrame(Clock::time_point start, double expected, double target, bool s
     // period shrinks every frame: judging the last second against the newest one counted on-time
     // frames as late and locked a 90 fps target at 20-45 fps).
     g.intervals.push_back({start, iv, iv > expected * 1.08, iv > expected * 1.25});
+    if (sDipOn) {
+        if (iv > expected * 1.08) sDip.late++;
+        if (iv > expected * 1.25) sDip.misses++, sDip.worst = std::max(sDip.worst, iv);
+    }
     size_t late = 0, misses = 0;
     for (const auto& i : g.intervals) {
         late += i.late ? 1 : 0;
@@ -513,8 +570,9 @@ void governFrame(Clock::time_point start, double expected, double target, bool s
         const double achieved = k ? sum / k : iv;
         const double lim = std::max({achieved * 1.03, expected * 1.05, g.limit});
         log("[pacing] frame rate not sustained (%zu of %zu frames late in 1 s, %zu by >25%%; %.1f ms achieved vs %.1f ms): "
-            "limited to %.1f fps",
-            late, n, misses, achieved * 1000.0, expected * 1000.0, 1.0 / lim);
+            "limited to %.1f fps%s",
+            late, n, misses, achieved * 1000.0, expected * 1000.0, 1.0 / lim,
+            keepRefreshHolding() ? " (refresh kept: near miss; LM_PACING_KEEP_REFRESH=0 for the even rate)" : "");
         g.limit = lim;
         g.floor = lim * 0.97;
         g.floorUntil = start + std::chrono::seconds(10);
@@ -568,10 +626,18 @@ void perfReport() {
         stat(p.worker, w, sizeof(w));
         stat(p.gpu, g, sizeof(g));
         const double fps = p.presents > 1 && p.last > p.first ? double(p.presents - 1) / (p.last - p.first) : 0.0;
+        // What the slowest stage costs per frame, independent of the display: a 60 Hz panel caps the
+        // presented rate, so this is the only figure that shows the headroom left (e.g. 8.4 ms).
+        std::vector<float> cost;
+        cost.reserve(p.host.size());
+        for (size_t i = 0; i < p.host.size(); i++) cost.push_back(std::max({p.host[i], p.worker[i], p.gpu[i]}));
+        std::sort(cost.begin(), cost.end());
+        const float capMs = cost[cost.size() / 2];
         log("[perf] last %.0f s: %.1f fps presented (target %d%s), game %.1f fps, %u intervals over 1.5x; ms per frame "
-            "median/p95/max: host %s, render worker %s, GPU %s; slowdowns %u, hitches %u",
+            "median/p95/max: host %s, render worker %s, GPU %s; cost %.1f ms (ceiling %.0f fps at the target rate); "
+            "slowdowns %u, hitches %u",
             span, fps, frame::targetFps(), sGov.limit > 0 ? ", limited now" : "", double(guest - sGuest) / span, p.over, h, w, g,
-            sGov.slowdowns - sSlow, sGov.hitches - sHitch);
+            capMs, capMs > 0 ? 1000.0 / capMs : 0.0, sGov.slowdowns - sSlow, sGov.hitches - sHitch);
     }
     sSince = now;
     sGuest = guest;
@@ -593,6 +659,8 @@ float sVrrHz = 0;
 char sStatus[128] = "";
 std::deque<Clock::time_point> sStarts;
 bool sPacing = false;
+
+bool keepRefreshHolding() { return sKeepHolding && sMode == Mode::Fifo; }
 
 bool detectVrr(float hz) {
     if (hz != sVrrHz) {
@@ -638,19 +706,38 @@ bool gamescope() {
 }
 
 bool presentTimingAvailable() {
-    // LM_PRESENT_TIMING=0/1 (test aid): off / on on any system.
+    // LM_PRESENT_TIMING=0/1 (test aid and opt-in): off / on on any system. Off by default on macOS
+    // and Linux: the record polls Dawn's OnSubmittedWorkDone every 250 us from a helper thread, and
+    // on Metal that costs frames at the refresh (same scene, 60 target: 51.5-55.5 fps with it on,
+    // 59.8-60.0 with it off). It buys [perf]'s host/worker/GPU medians and GPU keep-warm, so the
+    // playtest scripts set it; docs/LINUX.md records worse than a cost under Dawn/Vulkan.
+#if defined(_WIN32)
     static const bool sOn = [] {
-        if (const char* e = std::getenv("LM_PRESENT_TIMING")) return *e == '1';
-#ifdef _WIN32
-        return true;
-#else
-        return false;
-#endif
+        const char* e = std::getenv("LM_PRESENT_TIMING");
+        return !(e && *e == '0');
     }();
+#else
+    static const bool sOn = [] {
+        const char* e = std::getenv("LM_PRESENT_TIMING");
+        return e && *e == '1';
+    }();
+#endif
     return sOn;
 }
 
 bool keepWarmAvailable() { return presentTimingAvailable(); }
+
+// The frame-ahead limit (aurora_wait_frame_done) waits for frame N-2's GPU completion. It needs
+// low-latency completion reporting: on macOS Dawn's Metal completion arrives late enough that the
+// wait costs frames (same scene, 60 target: 51.5-56.4 fps with the limit, 59.8-60.0 without), so
+// the completion record stays on for [perf] and keep-warm while the limit stays off there.
+bool frameAheadAvailable() {
+#if defined(__APPLE__)
+    return false;
+#else
+    return presentTimingAvailable();
+#endif
+}
 
 bool keepWarmOn() { return keepWarmAvailable() && port::settings().rendering.gpuKeepWarm; }
 
@@ -715,6 +802,53 @@ void waitFrameAhead(u64 frame) {
 }
 }  // namespace
 
+namespace {
+const char* modeName() {
+    switch (sMode) {
+        case Mode::Grid: return "grid";
+        case Mode::Vblank: return "vblank";
+        case Mode::Fifo: return "fifo";
+        case Mode::Off: return "off";
+    }
+    return "?";
+}
+
+void dipReport() {
+    if (!sDipOn) return;
+    Dip& d = sDip;
+    const auto now = Clock::now();
+    if (d.since == Clock::time_point{}) d.since = now;
+    if (now - d.since < std::chrono::seconds(1)) return;
+    d.since = now;
+    const u32 slow = sGov.slowdowns - d.slowdowns;
+    d.slowdowns = sGov.slowdowns;
+    if (d.misses == 0 && d.hitches == 0) {
+        dipReset();
+        return;
+    }
+    // The host time of the second's frames (the figure the frame's own CPU work shows; the GPU
+    // time of recent frames is added when present timing exists, since the host alone cannot tell
+    // a GPU-bound frame from a late start).
+    double med = 0, worstHost = 0;
+    if (!d.host.empty()) {
+        const size_t mid = d.host.size() / 2;
+        std::nth_element(d.host.begin(), d.host.begin() + mid, d.host.end());
+        med = d.host[mid];
+        worstHost = *std::max_element(d.host.begin(), d.host.end());
+    }
+    char gpu[64] = "";
+    const double gpuMed = median(sGpuCost) * 1e3;
+    if (gpuMed > 0) std::snprintf(gpu, sizeof(gpu), ", GPU %.1f ms median", gpuMed);
+    const double target = frame::targetFps() > 0 ? 1.0 / double(frame::targetFps()) : 0.0;
+    log("[dip] %u misses in 1 s, worst %.1f ms, median %.1f ms, limit %.1f fps, divisor %u, target %.1f ms "
+        "(mode %s, %s, %u late, %u hitches, %u slowdowns, host max %.1f ms%s)",
+        d.misses, d.worst * 1e3, med, sGov.limit > 0 ? 1.0 / sGov.limit : (target > 0 ? 1.0 / target : 0.0), sDivisor,
+        target * 1e3, modeName(), presentTimingAvailable() ? "present timing" : "timer only", d.late, d.hitches, slow,
+        worstHost, gpu);
+    dipReset();
+}
+}  // namespace
+
 void beforeFrame() {
     // The host thread waits for each frame's scheduled start (SDL_DelayPrecise); at normal priority
     // that wait overslept by ~10 ms about once in 5 minutes (the thread not scheduled back in time
@@ -723,6 +857,7 @@ void beforeFrame() {
     (void)sPriority;
     cpu::report();
     pollTimings();
+    dipReport();
     perfReport();
     mem::report();
     vblankFollowWindow();
@@ -780,11 +915,18 @@ void beforeFrame() {
         const u32 n0 = minDivisor(minPeriod, refresh);
         u32 n = u32(std::max(1.0, std::ceil(std::max(minPeriod, need) / refresh - 0.02)));
         n = std::min<u32>(std::max(n, n0), 4);
+        // (refresh hold: a near miss keeps the refresh instead of halving it.)
+        if (sKeepRefresh && n > 1 && n0 == 1) {
+            if (!sKeepHolding && need <= refresh * kKeepRefreshEnter) sKeepHolding = true;
+            else if (sKeepHolding && need > refresh * kKeepRefreshLeave) sKeepHolding = false;
+            if (sKeepHolding) n = 1;
+        }
         sDivisor = n;
         base = double(n0) * refresh;
         period = double(n) * refresh;
         mode = n == 1 ? Mode::Fifo : vblankAvailable() ? Mode::Vblank : Mode::Grid;
     }
+    if (mode != Mode::Fifo) sKeepHolding = false;  // the refresh is not what paces this mode
     if (mode == Mode::Grid) {
         // The governor already smooths changes (it slows down only on repeated misses and speeds
         // up 2% per frame): follow it.
@@ -833,7 +975,7 @@ void beforeFrame() {
     sMode = mode;
     // The GPU at most one frame behind: the time from a frame's start to its display stays constant.
     const u64 begun = aurora_frame_counter();
-    if (mode != Mode::Fifo && begun > 1) waitFrameAhead(begun - 1);
+    if (frameAheadAvailable() && mode != Mode::Fifo && begun > 1) waitFrameAhead(begun - 1);
     sStarts.push_back(Clock::now());
     sCur.started = sStarts.back();
     while (sStarts.size() > 1 && sStarts.back() - sStarts.front() > std::chrono::seconds(1)) sStarts.pop_front();
@@ -915,6 +1057,8 @@ void afterFrame() {
     // (begun: the frame's start after any scheduling wait; the CPU part is begin..end)
     if (sPacing && !sStarts.empty()) r.begun = sStarts.back();
     if (!sPacing) r.begun = r.started;
+    // (LM_DIP_LOG: the frame's host time, the only per-frame cost left when present timing is off.)
+    if (sDipOn && sPacing) sDip.host.push_back(float(secs(r.ended - r.begun) * 1e3));
     if (sLog) {
         const interp::PresentInfo pi = interp::lastPresent();
         r.tape = pi.bSeq;
