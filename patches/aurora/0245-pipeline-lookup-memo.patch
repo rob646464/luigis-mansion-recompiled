@@ -1,0 +1,143 @@
+0245: Memoise the gx draw path's pipeline lookup per thread
+
+push_gx_draw (lib/gx/command_processor.cpp) calls find_pipeline whenever the draw cache's pipeline is
+invalid, i.e. on every shaded-state change, and the config it resolves is nearly always one the run
+has already resolved: the port logs precache 3055/3055, pending 0, demand-created 0 and no misses.
+Each repeat still canonicalised a copy of the ~2.8 KB config (data/pipelines.bin: 4387 rows, 12227051
+bytes of raw payload), XXH3-hashed it for the known-config bookkeeping, took the global g_pipelineMutex
+to insert into g_knownPipelines, hashed it again with the layout key, took the mutex again to look
+that up, and heap-allocated the closure that carries another copy. In a macOS `sample` of the port
+that was 193 of the FIFO thread's 1265 draw_prim samples, ~1.5 ms per presented frame: 78 in the hash
+and resolve_pipeline, 74 in remember_pipeline_config (40 hashing, 20 the config copy, 8 the insert, 7
+blocked on the mutex) and 31 canonicalising, which stays.
+
+find_canonical_gx_pipeline (0240's tail of find_pipeline) probes a per-thread memo first: 128
+direct-mapped slots holding the ref a canonical config resolved to, keyed by the config's bytes and
+the render targets' layout key. A slot is only a hint: the bytes are compared with memcmp
+(PipelineConfig and ShaderConfig assert has_unique_object_representations, so the comparison is
+exact) and a slot whose bytes differ is a miss. The index is a folded sum over the config's words,
+~a fifth of XXH3's work over the same bytes. The memo is thread_local (no new lock on the draw path)
+and allocated on first use, ~360 KiB for the thread that uses it.
+
+Two rules make a hit safe. The layout key must match, because resolve_pipeline keys the pipeline on
+(layout.key, config). And the epoch must be current: g_pipelineEpoch is bumped in
+shutdown_pipeline_cache directly before g_pipelines.clear(), the only place g_pipelines loses an
+entry, so a hit can only name a pipeline the full lookup would still find there. Skipping the
+bookkeeping is faithful: only a lookup that ran remember_pipeline_config fills an entry, so
+g_knownPipelines holds the config (aurora_pipeline_cache_export and the crash journal stay complete),
+firstFrameUsed could only have been lowered to a frame that is not older, and isNew is false for a
+repeat, so no pipeline_cache write and no queue_gx_variants is skipped. A pipeline still compiling, or
+one whose creation failed, returns the same ref as before and get_pipeline still decides. A stale hit
+would be a wrong pipeline and so a wrong picture, which is why a slot is only trusted after the exact
+byte comparison.
+
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <system_error>
+ #include <vector>
+@@ -1947,10 +1948,76 @@
+ 
+ static void queue_gx_variants(const gx::PipelineConfig& recorded, uint32_t accuracy, uint32_t enhBits,
+                               absl::flat_hash_set<HashType>* seen);
++
++// 0245: bumped in shutdown_pipeline_cache, directly before g_pipelines.clear() - the only place a
++// pipeline is dropped - so a memo entry filled against the old set cannot be used after it.
++static std::atomic<uint64_t> g_pipelineEpoch{1};
+ 
++// 0245: per-thread memo for the gx draw path's lookup. push_gx_draw resolves a pipeline on every
++// shaded-state change, and most of those configs are ones the run has already resolved: 193 of the
++// FIFO thread's 1265 draw_prim samples, ~1.5 ms of a presented frame (the same profile). An entry
++// holds the ref a canonical config resolved to, so a hit skips remember_pipeline_config,
++// resolve_pipeline and g_pipelineMutex. Configs are compared as bytes; gx::PipelineConfig and
++// gx::ShaderConfig assert has_unique_object_representations, so the comparison is exact.
++constexpr uint32_t kGxPipelineMemoEntries = 128; // 128 * (24 + sizeof(gx::PipelineConfig)): ~360 KiB per thread
++static_assert((kGxPipelineMemoEntries & (kGxPipelineMemoEntries - 1)) == 0);
++
++struct GxPipelineMemoEntry {
++  uint64_t epoch;     // g_pipelineEpoch the entry was filled at; 0 = never filled
++  uint64_t layoutKey; // the ref is a function of the canonical config and the layout key
++  PipelineRef ref;
++  alignas(gx::PipelineConfig) uint8_t config[sizeof(gx::PipelineConfig)];
++};
++
++// 0245: a separate lazily allocated block rather than a thread_local array: Darwin allocates an
++// image's whole TLS block for every thread that touches a thread_local of the image, including the
++// pipeline worker threads that never call this. Freed when the thread exits.
++struct GxPipelineMemo {
++  GxPipelineMemoEntry* entries = nullptr;
++  ~GxPipelineMemo() { std::free(entries); }
++};
++static thread_local GxPipelineMemo tl_gxPipelineMemo;
++
++// 0245: one folded sum over the config's words, ~a fifth of XXH3's work over the same bytes; it
++// only has to spread configs over the slots, since a wrongly shared slot is just a miss.
++static uint32_t gx_pipeline_memo_slot(const gx::PipelineConfig& config) noexcept {
++  const auto* bytes = reinterpret_cast<const uint8_t*>(&config);
++  uint64_t sum = 0;
++  size_t off = 0;
++  for (; off + 8 <= sizeof(config); off += 8) {
++    uint64_t word;
++    std::memcpy(&word, bytes + off, sizeof(word));
++    sum += word;
++  }
++  for (; off < sizeof(config); ++off) {
++    sum += bytes[off];
++  }
++  return static_cast<uint32_t>((sum * 0x9E3779B97F4A7C15ull) >> 32) & (kGxPipelineMemoEntries - 1);
++}
++
++// 0245: nullptr when the block cannot be allocated; the caller then does the whole lookup.
++static GxPipelineMemoEntry* gx_pipeline_memo_entry(const gx::PipelineConfig& config) noexcept {
++  if (tl_gxPipelineMemo.entries == nullptr) {
++    tl_gxPipelineMemo.entries =
++        static_cast<GxPipelineMemoEntry*>(std::calloc(kGxPipelineMemoEntries, sizeof(GxPipelineMemoEntry)));
++    if (tl_gxPipelineMemo.entries == nullptr) {
++      return nullptr;
++    }
++  }
++  return &tl_gxPipelineMemo.entries[gx_pipeline_memo_slot(config)];
++}
++
+ // 0240: the tail of find_pipeline for a canonical config: one hash feeds both the known-config
+ // bookkeeping and the pipeline key.
+ static PipelineRef find_canonical_gx_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
++  // 0245: the entry's epoch ties it to the g_pipelines it was resolved against, and its layout key to
++  // the render targets whose layout resolve_pipeline's runtime key includes.
++  const uint64_t epoch = g_pipelineEpoch.load(std::memory_order_relaxed);
++  GxPipelineMemoEntry* const entry = gx_pipeline_memo_entry(config);
++  if (entry != nullptr && entry->epoch == epoch && entry->layoutKey == layout.key &&
++      std::memcmp(entry->config, &config, sizeof(config)) == 0) {
++    return entry->ref;
++  }
+   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
+   const bool isNew = remember_pipeline_config(ShaderType::GX, config, current_frame(), true, cacheKey);
+   const auto ref = resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal, cacheKey);
+@@ -1958,6 +2027,12 @@
+     // A config the precache did not know: queue the variants it leads to under the current
+     // settings now (compiled while this one is), instead of one more miss for each later.
+     queue_gx_variants(config, gx::g_accuracyFlags.load(std::memory_order_relaxed), enhanced::precache_bits(), nullptr);
++  }
++  if (entry != nullptr) {
++    entry->layoutKey = layout.key;
++    entry->ref = ref;
++    std::memcpy(entry->config, &config, sizeof(config));
++    entry->epoch = epoch; // last, so the entry is never readable before the ref it holds
+   }
+   return ref;
+ }
+@@ -2227,6 +2302,9 @@
+   g_rebuildAccuracy.reset();
+   g_rebuildEnhBits.reset();
+   g_rebuildPending = 0;
++  // 0245: before the clear, so a memo entry filled against the old set is a miss from here on (an
++  // entry stores the epoch it was resolved under, which is loaded before the lookup runs).
++  g_pipelineEpoch.fetch_add(1, std::memory_order_relaxed);
+   g_pipelines.clear();
+   gx::clear_shader_module_cache(); // 0227
+   g_knownPipelines.clear();
